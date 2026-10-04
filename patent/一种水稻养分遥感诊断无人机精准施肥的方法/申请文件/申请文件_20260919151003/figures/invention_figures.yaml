@@ -1,0 +1,34 @@
+$schema: invention_figures
+version: 1
+figures:
+  - fig: 1
+    kind: flowchart
+    caption: 水稻养分遥感诊断公式关系示意图
+    nodes:
+      - {id: n1, row: 0, col: 0, shape: rect, label: "生育期s与光谱反射率B2、B3、B4"}
+      - {id: n2, row: 1, col: 0, shape: rect, label: "植被指数Is=fs(B2、B3、B4)"}
+      - {id: n3, row: 2, col: 0, shape: rect, label: "养分诊断值Ds=gs(Is)"}
+      - {id: n4, row: 3, col: 0, shape: rect, label: "分位阈值Tsj=Quantile(Ss、psj)"}
+      - {id: n5, row: 4, col: 0, shape: rect, label: "按阈值区间确定养分等级Cs(x)"}
+    edges:
+      - {from: n1, to: n2}
+      - {from: n2, to: n3}
+      - {from: n3, to: n4}
+      - {from: n4, to: n5}
+  - fig: 2
+    kind: flowchart
+    caption: 水稻无人机施肥处方图计算关系示意图
+    abstract: true
+    nodes:
+      - {id: q1, row: 0, col: 0, shape: rect, label: "养分等级Cs(x)"}
+      - {id: q2, row: 1, col: 0, shape: rect, label: "施肥量Qi=Qb[1+(b-i)k]"}
+      - {id: q3, row: 2, col: 0, shape: rect, label: "像元级施肥量Qs(x)"}
+      - {id: q4, row: 3, col: 0, shape: rect, label: "目标格尺寸rx=R/mx、ry=R/my"}
+      - {id: q5, row: 4, col: 0, shape: rect, label: "按重叠面积加权平均"}
+      - {id: q6, row: 5, col: 0, shape: rect, label: "固定地面尺度无人机处方图Ps(u、v)"}
+    edges:
+      - {from: q1, to: q2}
+      - {from: q2, to: q3}
+      - {from: q3, to: q4}
+      - {from: q4, to: q5}
+      - {from: q5, to: q6}

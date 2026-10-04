@@ -1,0 +1,7 @@
+schema: numeral-register
+version: 1
+patent_type: invention
+parts: []
+figures:
+  - {fig: 1, kind: flowchart, caption: 水稻养分遥感诊断公式关系示意图, disclosure_only: false}
+  - {fig: 2, kind: flowchart, caption: 水稻无人机施肥处方图计算关系示意图, disclosure_only: false}

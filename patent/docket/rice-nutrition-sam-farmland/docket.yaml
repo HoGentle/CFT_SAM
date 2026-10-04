@@ -1,0 +1,45 @@
+schema: patent-docket
+version: 1
+case_id: rice-nutrition-sam-farmland
+patent_type: invention
+start_mode: from_application
+phase: terminal_complete
+round: 1
+max_rounds: 3
+updated_at: '2026-10-04 21:20:00'
+paths:
+  docket_dir: E:/pythoncode/wurenji/code/Redo/patent/docket/rice-nutrition-sam-farmland
+  materials_dir: E:/pythoncode/wurenji/code/Redo/patent/一种水稻养分遥感诊断无人机精准施肥的方法
+  disclosure_dir: E:/pythoncode/wurenji/code/Redo/patent/一种水稻养分遥感诊断无人机精准施肥的方法/交底书
+  disclosure_md: E:/pythoncode/wurenji/code/Redo/patent/一种水稻养分遥感诊断无人机精准施肥的方法/交底书/一种水稻养分遥感诊断无人机精准施肥的方法_20260919151003.md
+  application_dir: E:/pythoncode/wurenji/code/Redo/patent/一种水稻养分遥感诊断无人机精准施肥的方法/申请文件/申请文件_20260919151003
+  issues_md: E:/pythoncode/wurenji/code/Redo/patent/一种水稻养分遥感诊断无人机精准施肥的方法/申请文件/申请文件_20260919151003/问题清单.md
+issues:
+  - id: SAM-01
+    summary: SAM点提示或自动掩膜的农田候选筛选判据与复核规则待实现
+    kind: disclosure_gap
+    disposition: defer
+    status: deferred
+    blocking: false
+    round_opened: 1
+  - id: SAM-02
+    summary: RGB与多光谱网格配准及Shapefile坐标系待实现验证，说明书和附图需补充实施例
+    kind: disclosure_gap
+    disposition: defer
+    status: deferred
+    blocking: false
+    round_opened: 1
+  - id: CLAIM-01
+    summary: 核对孕穗期RVI系数与项目配置的符号差异，并统一Word与Markdown公式细节
+    kind: claim_form
+    disposition: defer
+    status: deferred
+    blocking: false
+    round_opened: 1
+rounds:
+  - n: 1
+    application_dir: E:/pythoncode/wurenji/code/Redo/patent/一种水稻养分遥感诊断无人机精准施肥的方法/申请文件/申请文件_20260919151003
+    disclosure_dir: E:/pythoncode/wurenji/code/Redo/patent/一种水稻养分遥感诊断无人机精准施肥的方法/交底书
+    notes: 在指定权利要求书中新增4项SAM农田掩膜与处方计算从属权利要求；其余实现与说明书补充问题记入问题清单并延期。
+human_queue: []
+notes: ''

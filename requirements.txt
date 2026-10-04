@@ -1,0 +1,9 @@
+# 处方图系统依赖包
+# 使用环境：conda 环境 farm_edge（Python 3.10）
+# 安装方式：conda activate farm_edge 后执行 pip install -r requirements.txt
+# 说明：rasterio 的 PyPI 发行包已内置 GDAL，无需单独安装 gdal
+
+flask==3.1.3
+numpy==1.26.4
+pillow==10.2.0
+rasterio==1.4.3

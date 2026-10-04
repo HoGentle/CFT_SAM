@@ -1,0 +1,176 @@
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8765
+  },
+  "defaults": {
+    "nodata_value": 255,
+    "save_value_raster": true,
+    "processing_block_size": 1024,
+    "max_quantile_samples": 2000000,
+    "output_suffix": "_prescription",
+    "output_dtype": "float32",
+    "round_digits": 2,
+    "input_nodata_values": [255]
+  },
+  "recognition": {
+    "B1": ["RedEdge", "rededge"],
+    "B2": ["Green", "green"],
+    "B3": ["Red", "red"],
+    "B4": ["NIR", "nir"],
+    "preview_is_default": true,
+    "note": "文件名不区分大小写；RedEdge 优先于 Red 匹配；不含任何波段关键字的 tif 视为整体预览图（不参与诊断）"
+  },
+  "prescription": {
+    "formula_mode": {
+      "formula": "Q_i = Q_b * [1 + (b - i) * k]",
+      "base_level": 3,
+      "base_fertilizer": 10,
+      "change_coefficient": 0.025
+    },
+    "default_mapping": {
+      "1": 7.29,
+      "2": 8.1,
+      "3": 9.0,
+      "4": 9.9,
+      "5": 10.89
+    }
+  },
+  "resampling": {
+    "target_ground_resolution_m": 1.0,
+    "method": "average",
+    "note": "处方图重采样栅格宽度的默认值（网页端「重采样栅格设置」可手动修改，最低 1m）；method 固定 average（rasterio.warp，像元面积加权平均聚合，按地理地面距离换算像元尺寸）"
+  },
+  "preview": {
+    "max_pixels_long_side": 2048,
+    "jpeg_quality": 88
+  },
+  "stages": {
+    "1": {
+      "stage_key": "seedling",
+      "name": "幼苗期",
+      "diagnosis_name": "生物量",
+      "index_name": "SAVI",
+      "index_formula": "SAVI = (1 + 0.10) * (B4 - B3) / (B4 + B3 + 0.1)",
+      "diagnosis_formula": "SPAD = 95.7 * SAVI + 18.4",
+      "menu_text": "1.幼苗期\t (诊断指标: 生物量;\t 分级: 5;\t 模型: SPAD = 95.7 * SAVI + 18.4)",
+      "thresholds": [
+        { "level": 1, "quantile": 0.1, "growth_label": "长势差" },
+        { "level": 2, "quantile": 0.3, "growth_label": "长势较差" },
+        { "level": 3, "quantile": 0.7, "growth_label": "长势一般" },
+        { "level": 4, "quantile": 0.9, "growth_label": "长势较好" },
+        { "level": 5, "quantile": 1.0, "growth_label": "长势好" }
+      ]
+    },
+    "2": {
+      "stage_key": "tillering",
+      "name": "分蘖期",
+      "diagnosis_name": "生物量",
+      "index_name": "OSAVI",
+      "index_formula": "OSAVI = (1 + 0.16) * (B4 - B3) / (B4 + B3 + 0.16)",
+      "diagnosis_formula": "AGB = 2845.6 * OSAVI**2 - 2953.2 * OSAVI + 987.5",
+      "menu_text": "2.分蘖期\t (诊断指标: 生物量;\t 分级: 5;\t 模型: AGB = 2845.6 * OSAVI**2 - 2953.2 * OSAVI + 987.5)",
+      "thresholds": [
+        { "level": 1, "quantile": 0.1, "growth_label": "长势差" },
+        { "level": 2, "quantile": 0.3, "growth_label": "长势较差" },
+        { "level": 3, "quantile": 0.7, "growth_label": "长势一般" },
+        { "level": 4, "quantile": 0.9, "growth_label": "长势较好" },
+        { "level": 5, "quantile": 1.0, "growth_label": "长势好" }
+      ]
+    },
+    "3": {
+      "stage_key": "jointing",
+      "name": "拔节期",
+      "diagnosis_name": "生物量",
+      "index_name": "OSAVI",
+      "index_formula": "OSAVI = (1 + 0.16) * (B4 - B3) / (B4 + B3 + 0.16)",
+      "diagnosis_formula": "biomass = 26.107 ** (2.6114 * OSAVI)",
+      "menu_text": "3.拔节期\t (诊断指标: 生物量;\t 分级: 5;\t 模型: biomass = 26.107 ** (2.6114 * OSAVI))",
+      "thresholds": [
+        { "level": 1, "quantile": 0.1, "growth_label": "长势差" },
+        { "level": 2, "quantile": 0.3, "growth_label": "长势较差" },
+        { "level": 3, "quantile": 0.7, "growth_label": "长势一般" },
+        { "level": 4, "quantile": 0.9, "growth_label": "长势较好" },
+        { "level": 5, "quantile": 1.0, "growth_label": "长势好" }
+      ]
+    },
+    "4": {
+      "stage_key": "booting",
+      "name": "孕穗期",
+      "diagnosis_name": "LAI",
+      "index_name": "RVI",
+      "index_formula": "RVI = B4 / B3",
+      "diagnosis_formula": "LAI = -0.7375 * RVI + 9.6073",
+      "menu_text": "4.孕穗期 (诊断指标: LAI; 分级: 5; 模型: LAI = -0.7375 * RVI + 9.6073)",
+      "thresholds": [
+        { "level": 1, "quantile": 0.1, "growth_label": "长势差" },
+        { "level": 2, "quantile": 0.3, "growth_label": "长势较差" },
+        { "level": 3, "quantile": 0.7, "growth_label": "长势一般" },
+        { "level": 4, "quantile": 0.9, "growth_label": "长势较好" },
+        { "level": 5, "quantile": 1.0, "growth_label": "长势好" }
+      ]
+    },
+    "5": {
+      "stage_key": "heading",
+      "name": "抽穗期",
+      "diagnosis_name": "LAI",
+      "index_name": "NDVI",
+      "index_formula": "NDVI = (B4 - B3) / (B4 + B3)",
+      "diagnosis_formula": "LAI = 2.8339 * exp(1.3655 * NDVI)",
+      "menu_text": "5.抽穗期 (诊断指标: LAI; 分级: 5; 模型: LAI = 2.8339 * exp(1.3655 * NDVI))",
+      "thresholds": [
+        { "level": 1, "quantile": 0.1, "growth_label": "长势差" },
+        { "level": 2, "quantile": 0.3, "growth_label": "长势较差" },
+        { "level": 3, "quantile": 0.7, "growth_label": "长势一般" },
+        { "level": 4, "quantile": 0.9, "growth_label": "长势较好" },
+        { "level": 5, "quantile": 1.0, "growth_label": "长势好" }
+      ]
+    },
+    "6": {
+      "stage_key": "flowering",
+      "name": "扬花期",
+      "diagnosis_name": "LAI",
+      "index_name": "NRI",
+      "index_formula": "NRI = (B2 - B3) / (B2 + B3)",
+      "diagnosis_formula": "LAI = -7.354 * NRI + 7.9181",
+      "menu_text": "6.扬花期 (诊断指标: LAI; 分级: 5; 模型: LAI = -7.354 * NRI + 7.9181)",
+      "thresholds": [
+        { "level": 1, "quantile": 0.1, "growth_label": "长势差" },
+        { "level": 2, "quantile": 0.3, "growth_label": "长势较差" },
+        { "level": 3, "quantile": 0.7, "growth_label": "长势一般" },
+        { "level": 4, "quantile": 0.9, "growth_label": "长势较好" },
+        { "level": 5, "quantile": 1.0, "growth_label": "长势好" }
+      ]
+    },
+    "7": {
+      "stage_key": "pre_maturity",
+      "name": "成熟期前",
+      "diagnosis_name": "理论产量",
+      "index_name": "DVI",
+      "index_formula": "DVI = B4 - B3",
+      "diagnosis_formula": "yield_theory = 0.3878 * DVI - 195.83",
+      "menu_text": "7.成熟期前 (诊断指标: 理论产量; 分级: 4; 模型: yield_theory = 0.3878 * DVI - 195.83)",
+      "thresholds": [
+        { "level": 1, "quantile": 0.25, "growth_label": "产量较低" },
+        { "level": 2, "quantile": 0.6, "growth_label": "产量正常" },
+        { "level": 3, "quantile": 0.9, "growth_label": "产量较高" },
+        { "level": 4, "quantile": 1.0, "growth_label": "产量高" }
+      ]
+    },
+    "8": {
+      "stage_key": "maturity",
+      "name": "成熟期",
+      "diagnosis_name": "实际产量",
+      "index_name": "RVI",
+      "index_formula": "RVI = B4 / B3",
+      "diagnosis_formula": "yield_actual = -48.304 * RVI**2 + 518.11 * RVI - 528.44",
+      "menu_text": "8.成熟期 (诊断指标: 实际产量; 分级: 4; 模型: yield_actual = -48.304 * RVI**2 + 518.11 * RVI - 528.44)",
+      "thresholds": [
+        { "level": 1, "quantile": 0.25, "growth_label": "产量较低" },
+        { "level": 2, "quantile": 0.6, "growth_label": "产量正常" },
+        { "level": 3, "quantile": 0.9, "growth_label": "产量较高" },
+        { "level": 4, "quantile": 1.0, "growth_label": "产量高" }
+      ]
+    }
+  }
+}

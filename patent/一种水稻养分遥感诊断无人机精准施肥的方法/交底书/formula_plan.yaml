@@ -1,0 +1,103 @@
+$schema: formula_plan
+version: 1
+updated_at: "2026-09-19 15:10:03"
+theme_summary: "以公式链为核心，将无人机多光谱反射率按水稻生育期转换为诊断值，经分位阈值形成养分等级，再转换并聚合为固定地面尺度施肥处方图。"
+paradigm_ids: []
+plain_zh: "按生育期选择植被指数和诊断函数，按诊断值分位数建立等级边界，按等级公式计算施肥量，再按真实地面距离和重叠面积聚合为目标处方格。"
+equations:
+  - tag: 1
+    origin: source
+    source_ref: "config.json stages；core/diagnose.py compute_index"
+    latex: "I_s=f_s(B_2,B_3,B_4)"
+    role: score
+  - tag: 2
+    origin: source
+    source_ref: "config.json stages；core/diagnose.py compute_diagnosis"
+    latex: "D_s=g_s(I_s)"
+    role: score
+  - tag: 3
+    origin: source
+    source_ref: "core/diagnose.py resolve_quantile_thresholds"
+    latex: "T_{s,j}=\\operatorname{Quantile}(\\mathcal{S}_s,p_{s,j})"
+    role: threshold
+  - tag: 4
+    origin: source
+    source_ref: "core/diagnose.py classify_block"
+    latex: "C_s(x)=j,\\quad T_{s,j-1}<D_s(x)\\le T_{s,j}"
+    role: classify
+  - tag: 5
+    origin: source
+    source_ref: "core/prescription.py build_formula_mapping"
+    latex: "Q_i=Q_b[1+(b-i)k]"
+    role: assign
+  - tag: 6
+    origin: source
+    source_ref: "core/prescription.py write_resampled_prescription"
+    latex: 'r_x=R/m_x,\quad r_y=R/m_y'
+    role: constraint
+  - tag: 7
+    origin: source
+    source_ref: "core/prescription.py write_resampled_prescription；average 重采样"
+    latex: "P_s(u,v)=\\frac{\\sum_{x\\in V_{u,v}}a_{x,u,v}Q_s(x)}{\\sum_{x\\in V_{u,v}}a_{x,u,v}}"
+    role: aggregate
+omitted: []
+symbols:
+  - symbol: "s"
+    meaning_zh: "水稻生育期标识"
+    unit_zh: "枚举值"
+  - symbol: "B_2"
+    meaning_zh: "绿光通道反射率"
+    unit_zh: "与输入影像一致"
+  - symbol: "B_3"
+    meaning_zh: "红光通道反射率"
+    unit_zh: "与输入影像一致"
+  - symbol: "B_4"
+    meaning_zh: "近红外通道反射率"
+    unit_zh: "与输入影像一致"
+  - symbol: "I_s"
+    meaning_zh: "生育期 s 对应的植被指数"
+    unit_zh: "依指数定义"
+  - symbol: "D_s"
+    meaning_zh: "生育期 s 对应的诊断值"
+    unit_zh: "依诊断指标定义"
+  - symbol: "i"
+    meaning_zh: "诊断等级"
+    unit_zh: "正整数"
+  - symbol: "Q_i"
+    meaning_zh: "诊断等级 i 对应的施肥量"
+    unit_zh: "kg/亩"
+  - symbol: "Q_b"
+    meaning_zh: "基准等级的基准施肥量"
+    unit_zh: "kg/亩"
+  - symbol: "b"
+    meaning_zh: "基准诊断等级"
+    unit_zh: "正整数"
+  - symbol: "k"
+    meaning_zh: "相邻等级施肥量变化系数"
+    unit_zh: "无量纲"
+  - symbol: "R"
+    meaning_zh: "目标地面栅格宽度"
+    unit_zh: "m"
+  - symbol: "m_x"
+    meaning_zh: "源坐标系横向一个坐标单位对应的地面米数"
+    unit_zh: "m/坐标单位"
+  - symbol: "m_y"
+    meaning_zh: "源坐标系纵向一个坐标单位对应的地面米数"
+    unit_zh: "m/坐标单位"
+  - symbol: "r_x"
+    meaning_zh: "目标栅格横向像元尺寸"
+    unit_zh: "源坐标单位"
+  - symbol: "r_y"
+    meaning_zh: "目标栅格纵向像元尺寸"
+    unit_zh: "源坐标单位"
+numeric_example:
+  given:
+    "Q_b": 10
+    "b": 3
+    "i": 1
+    "k": 0.025
+    "R": 1
+  compute_zh: "一级施肥量为 10×[1+(3-1)×0.025]=10.5 kg/亩；目标地面栅格宽度取 1 m。"
+  result:
+    "Q_i": 10.5
+notes_zh: "式(1)和式(2)为按生育期路由的函数关系，具体八组源公式在交底书参数表中逐项列明。"

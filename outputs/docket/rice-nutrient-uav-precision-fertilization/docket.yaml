@@ -1,0 +1,87 @@
+schema: patent-docket
+version: 1
+case_id: rice-nutrient-uav-precision-fertilization
+patent_type: invention
+start_mode: from_zero
+phase: terminal_complete
+round: 1
+max_rounds: 3
+updated_at: '2026-09-19 14:53:48'
+paths:
+  docket_dir: outputs/docket/rice-nutrient-uav-precision-fertilization
+  materials_dir: .
+  disclosure_dir: patent/一种水稻养分遥感诊断无人机精准施肥的方法/交底书
+  disclosure_md: patent/一种水稻养分遥感诊断无人机精准施肥的方法/交底书/一种水稻养分遥感诊断无人机精准施肥的方法_20260919143207.md
+  application_dir: patent/一种水稻养分遥感诊断无人机精准施肥的方法/申请文件/申请文件_20260919143626
+  issues_md: patent/一种水稻养分遥感诊断无人机精准施肥的方法/申请文件/申请文件_20260919143626/问题清单.md
+issues:
+- id: I-01
+  kind: human_fact
+  disposition: defer
+  blocking: false
+  status: deferred
+  round_opened: 1
+  summary: 发明人、申请人及技术联系人著录信息待补充。
+  evidence: patent/一种水稻养分遥感诊断无人机精准施肥的方法/申请文件/申请文件_20260919143626/问题清单.md#须由申请人或发明人补充
+- id: I-02
+  kind: disclosure_gap
+  disposition: defer
+  blocking: false
+  status: deferred
+  round_opened: 1
+  summary: 商业作业采用的肥料、无人机、撒肥标定和飞行参数待实测补充。
+  evidence: patent/一种水稻养分遥感诊断无人机精准施肥的方法/申请文件/申请文件_20260919143626/问题清单.md#须由申请人或发明人补充
+- id: I-03
+  kind: disclosure_gap
+  disposition: defer
+  blocking: false
+  status: deferred
+  round_opened: 1
+  summary: 八组生育期模型的试验来源、品种地域条件及验证记录待确认。
+  evidence: patent/一种水稻养分遥感诊断无人机精准施肥的方法/申请文件/申请文件_20260919143626/问题清单.md#须由申请人或发明人补充
+- id: I-04
+  kind: disclosure_gap
+  disposition: defer
+  blocking: false
+  status: deferred
+  round_opened: 1
+  summary: 手动施肥量映射的农艺确定依据待补充。
+  evidence: patent/一种水稻养分遥感诊断无人机精准施肥的方法/申请文件/申请文件_20260919143626/问题清单.md#须由申请人或发明人补充
+- id: I-05
+  kind: scope_strategy
+  disposition: defer
+  blocking: false
+  status: deferred
+  round_opened: 1
+  summary: 独立权利要求的组合创造性及系统独立权利要求保留策略待代理人复核。
+  evidence: patent/一种水稻养分遥感诊断无人机精准施肥的方法/申请文件/申请文件_20260919143626/问题清单.md#代理人复核事项
+- id: I-06
+  kind: disclosure_gap
+  disposition: defer
+  blocking: false
+  status: deferred
+  round_opened: 1
+  summary: 分类号高级检索因页面导航超时，正式提交前待补做系统检索。
+  evidence: patent/一种水稻养分遥感诊断无人机精准施肥的方法/申请文件/申请文件_20260919143626/问题清单.md#代理人复核事项
+- id: I-07
+  kind: machine_format
+  disposition: application_fix
+  blocking: false
+  status: done
+  round_opened: 1
+  summary: 附图、权利要求、件号和支持关系机器检查均已通过。
+  evidence: patent/一种水稻养分遥感诊断无人机精准施肥的方法/申请文件/申请文件_20260919143626/问题清单.md#机器检查
+rounds:
+- round: 1
+  disclosure_md: patent/一种水稻养分遥感诊断无人机精准施肥的方法/交底书/一种水稻养分遥感诊断无人机精准施肥的方法_20260919143207.md
+  application_dir: patent/一种水稻养分遥感诊断无人机精准施肥的方法/申请文件/申请文件_20260919143626
+  issues_md: patent/一种水稻养分遥感诊断无人机精准施肥的方法/申请文件/申请文件_20260919143626/问题清单.md
+  result: 已完成交底书、申请四件套、附图与结构和渲染检查；非阻塞补充事项转为递延。
+human_queue:
+- I-01
+- I-02
+- I-03
+- I-04
+- I-05
+- I-06
+notes: '用户指定名称：一种水稻养分遥感诊断无人机精准施肥的方法；按发明专利从零形成交底书及申请文件。本轮已完成内部一致性和版面检查；不代表授权结论或国知局客户端校验。'

@@ -1,0 +1,47 @@
+$schema: application_plan
+version: 1
+patent_type: invention
+case_dir: "E:/pythoncode/wurenji/code/Redo/patent/一种水稻养分遥感诊断无人机精准施肥的方法/交底书"
+disclosure: "一种水稻养分遥感诊断无人机精准施肥的方法_20260919151003.md"
+status: draft
+problem: "不同水稻生育期的光谱响应、养分诊断指标和处方尺度不同，现有方法缺少从多光谱反射率到固定地面栅格施肥量的连续可复算公式关系。"
+means: "按生育期选择植被指数和诊断函数，以诊断值分位数建立等级阈值，将等级按参数公式转换为施肥量，再根据真实地面距离换算目标栅格并进行有效像元面积加权聚合。"
+effect: "使养分诊断、相对分级、施肥量计算和处方图构造在同一数学链条中连续对应，并适应不同生育期、管理区和源坐标单位。"
+principal_claim: "一种水稻养分遥感诊断无人机精准施肥的方法"
+fallback:
+  - "生育期对应的植被指数与诊断函数成对选择"
+  - "诊断值分位阈值和左开右闭等级区间"
+  - "等概率蓄水池抽样估计分位阈值"
+  - "等级、基准等级、基准施肥量和变化系数的施肥量公式"
+  - "按真实地面距离换算目标格并进行有效像元面积加权聚合"
+open_questions:
+  - "八组诊断公式的试验来源、适用品种和地域条件待补充"
+  - "施肥量公式参数的农艺标定依据待补充"
+  - "SAM自动候选掩膜的农田筛选判据、点提示规范及人工复核流程待实现和补充"
+  - "RGB与多光谱影像坐标参考、网格配准、掩膜重采样及Shapefile坐标系待明确"
+  - "说明书和附图尚无SAM分割技术实施方式，正式提交前须补充并建立支持关系"
+suggested_abstract_figure: "图2"
+claim_tree:
+  independent:
+    - id: 1
+      kind: method
+      essential:
+        - "按生育期选择植被指数函数和诊断函数"
+        - "由有效诊断值分位数确定等级阈值"
+        - "按阈值区间确定养分等级"
+        - "将养分等级按参数公式转换为施肥量"
+        - "按真实地面距离和重叠面积构造固定地面处方格"
+  # 以下原有公式条款在Word中因新增四项从属权利要求而顺延至权利要求6—17。
+  dependents:
+    - {id: 2, refers: [1], layer: segmentation, aligns_embodiment: "待实现", point: "SAM点提示或自动生成候选掩膜并确定农田区域"}
+    - {id: 3, refers: [2], layer: vector, aligns_embodiment: "待实现", point: "掩膜矢量化并输出农田边界Shapefile"}
+    - {id: 4, refers: [2], layer: alignment, aligns_embodiment: "待实现", point: "掩膜映射到RGB和各多光谱波段网格并排除掩膜外像元"}
+    - {id: 5, refers: [3], layer: statistics, aligns_embodiment: "待实现", point: "掩膜内有效像元用于植被指数、诊断及分位阈值计算"}
+    - {id: 10, refers: [1], layer: formula, aligns_embodiment: "第一种", point: "幼苗期、分蘖期和拔节期公式"}
+    - {id: 11, refers: [1], layer: formula, aligns_embodiment: "第一种", point: "孕穗期、抽穗期和扬花期公式"}
+    - {id: 12, refers: [1], layer: formula, aligns_embodiment: "第三种", point: "成熟期前和成熟期公式"}
+    - {id: 9, refers: [1], layer: threshold, aligns_embodiment: "第一种", point: "五级或四级分位点和区间规则"}
+    - {id: 6, refers: [1], layer: sampling, aligns_embodiment: "第一种", point: "固定种子的蓄水池抽样"}
+    - {id: 7, refers: [1], layer: formula, aligns_embodiment: "第一种", point: "等级到施肥量的参数公式和区域合并"}
+    - {id: 8, refers: [1], layer: grid, aligns_embodiment: "第一种", point: "米制目标格换算和面积加权聚合"}
+named_figures: []

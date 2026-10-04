@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>水稻施肥处方图生成系统</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-title">
+      <span class="logo">🌾</span>
+      <div>
+        <h1>水稻施肥处方图生成系统</h1>
+        <p class="subtitle">无人机多光谱影像 · 营养诊断 · 大疆兼容处方图</p>
+      </div>
+    </div>
+    <div class="topbar-actions">
+      <span class="status-dot" id="server-status" title="服务运行中"></span>
+      <button class="btn ghost" id="btn-reset" type="button">清空会话</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="workflow">
+
+      <!-- ① 数据接入 -->
+      <div class="card" id="card-input">
+        <div class="card-head">
+          <span class="step-no">1</span>
+          <h2>数据接入</h2>
+        </div>
+        <div class="tabs" id="input-tabs">
+          <button class="tab active" data-tab="upload" type="button">本地上传</button>
+          <button class="tab" data-tab="folder" type="button">文件夹路径</button>
+        </div>
+
+        <div id="pane-upload">
+          <div class="dropzone" id="dropzone">
+            <input type="file" id="file-input" multiple accept=".tif,.tiff" hidden>
+            <input type="file" id="folder-input" webkitdirectory multiple hidden>
+            <div class="dz-icon">📁</div>
+            <p><b>点击选择文件</b> 或拖拽 tif 影像到此处</p>
+            <p class="dz-sub">支持 Ctrl 多选 / 整个结果文件夹，大文件将分块上传</p>
+            <div class="dz-buttons">
+              <button class="btn primary" type="button" id="btn-pick-files">选择文件</button>
+              <button class="btn" type="button" id="btn-pick-folder">选择文件夹</button>
+            </div>
+          </div>
+          <div class="upload-queue" id="upload-queue"></div>
+        </div>
+
+        <div id="pane-folder" class="hidden">
+          <div class="folder-row">
+            <input type="text" id="folder-path" placeholder="例如 E:\data\nx_data" spellcheck="false">
+            <button class="btn primary" type="button" id="btn-scan-folder">扫描文件夹</button>
+          </div>
+          <p class="hint">扫描后直接引用本地文件（不拷贝），适合 1GB 以上的大影像。</p>
+        </div>
+
+        <div class="recognition-hint">
+          <b>文件名自动识别：</b>含 <code>RedEdge</code> → B1 红边 ｜ 含 <code>Green</code> → B2 绿光 ｜
+          含 <code>Red</code> → B3 红光 ｜ 含 <code>NIR</code> → B4 近红外 ｜
+          不含关键字的 <code>result</code> 图 → 整体预览图（仅展示，不参与诊断）
+        </div>
+
+        <div class="file-table" id="file-table"></div>
+
+        <div class="actions">
+          <button class="btn primary" type="button" id="btn-validate">校验数据并生成预览</button>
+        </div>
+      </div>
+
+      <!-- ② 校验结果 -->
+      <div class="card hidden" id="card-validation">
+        <div class="card-head">
+          <span class="step-no">2</span>
+          <h2>校验结果</h2>
+        </div>
+        <div id="validation-body"></div>
+      </div>
+
+      <!-- ③ 参数设置 -->
+      <div class="card hidden" id="card-params">
+        <div class="card-head">
+          <span class="step-no">3</span>
+          <h2>参数设置</h2>
+        </div>
+
+        <h3 class="param-title">生育期与诊断模型</h3>
+        <div class="stage-grid" id="stage-grid"></div>
+        <div class="stage-formula hidden" id="stage-formula"></div>
+
+        <h3 class="param-title">诊断分级与施肥映射设置（单位：Kg(升)/亩）</h3>        <div class="level-row">
+          <label class="inline-label">分级数量
+            <select id="level-count">
+              <option value="2">2 级</option>
+              <option value="3">3 级</option>
+              <option value="4">4 级</option>
+              <option value="5" selected>5 级（默认）</option>
+              <option value="6">6 级</option>
+              <option value="7">7 级</option>
+              <option value="8">8 级</option>
+              <option value="9">9 级</option>
+              <option value="10">10 级</option>
+            </select>
+          </label>
+          <div class="radio-row" id="mapping-mode-row">
+            <label><input type="radio" name="mapping-mode" value="formula" checked> 公式计算</label>
+            <label><input type="radio" name="mapping-mode" value="manual"> 手动指定</label>
+          </div>
+          <span class="hint">可再手动调整每级的累计占比（%）；占比按从小到大排序，最后一级自动补足到 100%。</span>
+        </div>
+        <div id="mapping-formula" class="mapping-panel">
+          <div class="formula-row">
+            <label><span class="fld-name">基准等级 b</span><input type="number" id="f-base-level" step="1"></label>
+            <label><span class="fld-name">基准施肥量 Q<sub>b</sub></span><input type="number" id="f-base-fert" step="0.01"></label>
+            <label><span class="fld-name">系数 k</span><input type="number" id="f-coeff" step="0.001"></label>
+            <span class="hint">Q<sub>i</sub> = Q<sub>b</sub> × [1 + (b − i) × k]</span>
+          </div>
+        </div>
+        <table class="mini-table level-table" id="level-table"></table>
+        <div id="settings-binding" class="hint hidden"></div>
+
+        <h3 class="param-title">生成范围</h3>
+        <div class="radio-row" id="make-mode-row">
+          <label><input type="radio" name="make-mode" value="full" checked> 全图制作</label>
+          <label><input type="radio" name="make-mode" value="roi"> 感兴趣区域制作（<span id="make-mode-roi-count">0</span> 个区域）</label>
+        </div>
+        <p class="hint" id="make-mode-hint">在右侧预览图点击「✏️ 编辑感兴趣区域」进行标点，左键标点、右键完成当前区域。</p>
+
+        <h3 class="param-title">重采样栅格设置</h3>
+        <div class="level-row">
+          <label class="inline-label">栅格宽度（最低1m）
+            <input type="number" id="resample-cell" min="1" step="1" value="1">
+          </label>
+        </div>
+
+        <div class="actions">
+          <button class="btn primary big" type="button" id="btn-run" disabled>开始生成诊断图与处方图</button>
+        </div>
+      </div>
+
+      <!-- ④ 运行进度 -->
+      <div class="card hidden" id="card-progress">
+        <div class="card-head">
+          <span class="step-no">4</span>
+          <h2>运行进度</h2>
+        </div>
+        <div class="progress-wrap">
+          <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+          <div class="progress-meta">
+            <span id="progress-phase">-</span>
+            <span id="progress-percent">0%</span>
+          </div>
+          <p class="progress-message" id="progress-message"></p>
+        </div>
+        <details class="log-box">
+          <summary>运行日志</summary>
+          <pre id="log-output"></pre>
+        </details>
+      </div>
+
+      <!-- ⑤ 结果 -->
+      <div class="card hidden" id="card-result">
+        <div class="card-head">
+          <span class="step-no">5</span>
+          <h2>生成结果</h2>
+        </div>
+        <div class="result-chips" id="result-chips"></div>
+        <table class="mini-table" id="result-table"></table>
+        <div class="legend-note" id="legend-note"></div>
+
+        <h3 class="param-title">输出文件</h3>
+        <div class="output-files" id="output-files"></div>
+        <div class="actions">
+          <button class="btn" type="button" id="btn-open-folder">打开输出文件夹</button>
+        </div>
+
+        <details class="advanced" id="dj2pr-box">
+          <summary>高级：按大疆模板替换处方图（模板网格适配）</summary>
+          <div class="folder-row">
+            <input type="text" id="dj2pr-template" placeholder="模板 tif 路径，例如大疆智图导出的 fertilizer.tif" spellcheck="false">
+            <select id="dj2pr-method">
+              <option value="nearest">最近邻</option>
+              <option value="average">平均</option>
+            </select>
+          </div>
+          <div class="actions">
+            <button class="btn" type="button" id="btn-dj2pr">开始模板替换</button>
+          </div>
+          <div id="dj2pr-report" class="hint"></div>
+        </details>
+      </div>
+    </section>
+
+    <!-- 右侧图窗 -->
+    <div class="viewer-column">
+    <section class="viewer-panel">
+      <div class="viewer-main">
+      <div class="viewer-tabs" id="viewer-tabs">
+        <button class="tab active" data-view="input" type="button">整体预览</button>
+        <button class="tab" data-view="class" type="button" disabled>诊断图</button>
+        <button class="tab" data-view="prescription" type="button" disabled>处方图</button>
+      </div>
+      <div class="viewer-stage" id="viewer-stage">
+        <div id="viewer-transform" class="viewer-transform">
+          <img id="viewer-img" alt="" draggable="false">
+          <canvas id="roi-canvas" class="hidden"></canvas>
+        </div>
+        <div class="viewer-empty" id="viewer-empty">
+          <div>
+            <p class="dz-icon">🛰️</p>
+            <p>上传影像并校验后，此处显示整体预览图</p>
+          </div>
+        </div>
+      </div>
+      <div class="viewer-main-rest">
+        <div class="viewer-stats" id="viewer-stats"></div>
+        <div class="roi-toolbar hidden" id="roi-toolbar">
+          <span class="roi-hint">左键标点（任意顺序，自动构成最小凸包）· 左键点已有标点删除该点（凸包内缩）· 右键完成当前区域 · 撤销可退回已完成区域继续编辑 · 新区域标点不能落在已有区域内</span>
+          <span class="roi-toolbar-btns">
+            <button class="btn tiny" type="button" id="btn-roi-undo">撤销上一点</button>
+            <button class="btn tiny" type="button" id="btn-roi-clear-current">取消当前区域</button>
+            <button class="btn tiny" type="button" id="btn-roi-clear-all">清空全部</button>
+            <button class="btn tiny primary" type="button" id="btn-roi-done">退出编辑</button>
+          </span>
+        </div>
+        <div class="viewer-footer">
+          <div class="viewer-legend" id="viewer-legend"></div>
+          <div class="viewer-tools">
+            <button class="btn tiny" type="button" id="btn-roi-edit" disabled title="校验并生成预览后可用">✏️ 编辑感兴趣区域</button>
+            <button class="btn tiny hidden" type="button" id="btn-roi-groups" title="为不同区域组分别设置诊断分级与施肥映射">👥 编辑分组</button>
+            <button class="btn tiny" type="button" id="btn-zoom-in">＋</button>
+            <button class="btn tiny" type="button" id="btn-zoom-out">－</button>
+            <button class="btn tiny" type="button" id="btn-fit">适应</button>
+          </div>
+        </div>
+      </div>
+      </div>
+    </section>
+      <details class="roi-panel hidden" id="roi-panel">
+        <summary>感兴趣区域列表（<span id="roi-region-count">0</span> 个区域，<span id="roi-point-count">0</span> 个标点）</summary>
+        <div class="roi-panel-actions hidden" id="roi-panel-actions">
+          <button class="btn tiny" type="button" id="btn-group-add" title="将勾选的区域组成一个新分组">＋ 添加为分组</button>
+          <button class="btn tiny primary" type="button" id="btn-group-finish">✔ 完成</button>
+        </div>
+        <div id="roi-region-list" class="roi-region-list"></div>
+      </details>
+      <div class="viewer-mapinfo hidden" id="viewer-mapinfo"></div>
+    </div>
+  </main>
+
+  <div class="toast hidden" id="toast"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
