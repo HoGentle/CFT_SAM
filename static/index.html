@@ -218,7 +218,20 @@
       <div class="viewer-main-rest">
         <div class="viewer-stats" id="viewer-stats"></div>
         <div class="roi-toolbar hidden" id="roi-toolbar">
-          <span class="roi-hint">左键标点（任意顺序，自动构成最小凸包）· 左键点已有标点删除该点（凸包内缩）· 右键完成当前区域 · 撤销可退回已完成区域继续编辑 · 新区域标点不能落在已有区域内</span>
+          <label>划区方式 <select id="roi-method"><option value="manual">手工凸包</option><option value="sam">点提示自动划区</option></select></label>
+          <span class="roi-hint" id="roi-edit-hint">左键标点自动构成凸包 · 点击已有点删除 · 右键完成当前区域</span>
+          <span class="roi-toolbar-btns hidden" id="sam-controls">
+            <label>分割模型 <select id="sam-model"><option value="sam1_vit_h">SAM 1 · ViT-H</option></select></label>
+            <label>提示类型 <select id="sam-label"><option value="1">保留点（绿色）</option><option value="0">排除点（红色）</option></select></label>
+            <label><input type="checkbox" id="sam-fill-holes"> 去洞</label>
+            <label>最大洞面积 <input type="number" id="sam-hole-area" min="0.01" step="0.1" value="10" disabled> 平方米</label>
+            <label><input type="checkbox" id="sam-smooth-boundary"> 平滑边界</label>
+            <label><input type="checkbox" id="sam-ignore-boundaries"> 忽略细小分隔</label>
+            <label title="合并细窄分割缝隙；过大的阈值可能合并真实田埂">宽度阈值 <input type="number" id="sam-gap-width" min="0.01" max="5" step="0.01" value="0.2" disabled> 米</label>
+            <button class="btn tiny" type="button" id="btn-sam-predict">重新识别</button>
+            <button class="btn tiny primary" type="button" id="btn-sam-accept" disabled>确认加入区域</button>
+            <span class="roi-hint" id="sam-status" role="status" aria-live="polite"></span>
+          </span>
           <span class="roi-toolbar-btns">
             <button class="btn tiny" type="button" id="btn-roi-undo">撤销上一点</button>
             <button class="btn tiny" type="button" id="btn-roi-clear-current">取消当前区域</button>

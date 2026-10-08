@@ -1,7 +1,7 @@
 """感兴趣区域（ROI）工具。
 
-流程：界面上在预览图标点（任意顺序）→ 前端计算最小凸包并记录标点经纬度 →
-服务端把凸包经纬度顶点换算到诊断网格像素坐标 → 按分块窗口做扫描线栅格化，
+流程：手工标点生成凸包，或点提示分割生成含空洞的真实轮廓 →
+服务端把轮廓经纬度顶点换算到诊断网格像素坐标 → 按分块窗口做扫描线栅格化，
 与有效掩膜求交。全图尺寸可达数十亿像素，因此掩膜必须逐块生成，不能整图驻留。
 """
 
@@ -38,24 +38,40 @@ def convex_hull(points):
     return np.asarray(hull, dtype="float64")
 
 
-def polygons_lonlat_to_pixel(polygons_lonlat, transform):
-    """经纬度多边形顶点 -> 诊断网格 (col, row) 浮点坐标（重排为凸包顺序）。"""
+def polygons_lonlat_to_pixel(polygons_lonlat, transform, crs=None):
+    """经纬度转诊断网格；手工区域重排凸包，分割区域保留边界和空洞。"""
+    from rasterio.warp import transform as project
+
     inverse = ~transform
     polygons_px = []
-    for points in polygons_lonlat:
+
+    def convert(points):
         pts = np.asarray(points, dtype="float64")
-        if pts.ndim != 2 or pts.shape[1] != 2:
+        if pts.ndim != 2 or pts.shape[1] != 2 or len(pts) < 3 or not np.isfinite(pts).all():
             raise ValueError("多边形顶点必须是 [lon, lat] 数组")
-        cols, rows = inverse * (pts[:, 0], pts[:, 1])
-        poly = np.stack([cols, rows], axis=1)
-        polygons_px.append(convex_hull(poly))
+        xs, ys = pts[:, 0], pts[:, 1]
+        if crs is not None:
+            xs, ys = project("EPSG:4326", crs, xs.tolist(), ys.tolist())
+            xs, ys = np.asarray(xs), np.asarray(ys)
+        cols, rows = inverse * (xs, ys)
+        return np.stack([cols, rows], axis=1)
+
+    for region in polygons_lonlat:
+        if isinstance(region, dict):
+            poly = convert(region["hull"])
+            if region.get("source") == "sam":
+                polygons_px.append({"hull": poly, "holes": [convert(h) for h in region.get("holes", [])]})
+            else:
+                polygons_px.append(convex_hull(poly))
+        else:
+            polygons_px.append(convex_hull(convert(region)))
     return polygons_px
 
 
 def rasterize_polygons_in_window(polygons_px, window):
     """在窗口内栅格化多边形（偶奇规则，按像元中心判定），返回 bool 掩膜。
 
-    polygons_px: 顶点为全局 (col, row) 像素坐标的多边形列表。
+    polygons_px: 全局像素坐标的顶点数组，或包含 hull、holes 的区域字典。
     """
     height, width = int(window.height), int(window.width)
     mask = np.zeros((height, width), dtype=bool)
@@ -63,6 +79,16 @@ def rasterize_polygons_in_window(polygons_px, window):
     col_off = int(window.col_off)
 
     for poly in polygons_px:
+        if isinstance(poly, dict):
+            # 自动轮廓可能含大量顶点，使用原生栅格化避免逐行遍历所有边。
+            from affine import Affine
+            from rasterio.features import rasterize
+            geometry = {"type": "Polygon", "coordinates": [
+                np.asarray(ring).tolist() for ring in [poly["hull"], *poly.get("holes", [])]
+            ]}
+            mask |= rasterize([(geometry, 1)], out_shape=(height, width),
+                              transform=Affine.translation(col_off, row_off), dtype="uint8").astype(bool)
+            continue
         x = poly[:, 0]
         y = poly[:, 1]
         n = len(poly)

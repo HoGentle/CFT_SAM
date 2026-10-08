@@ -659,10 +659,7 @@ function readRunParams() {
     },
   };
   if (makeMode === "roi") {
-    params.roi_regions = roi.regions.map((region) => ({
-      hull: region.hull.map((p) => [p.lon, p.lat]),
-      points: region.points.map((p) => [p.lon, p.lat]),
-    }));
+    params.roi_regions = roi.regions.map(serializeRoiRegion);
     if (roi.groups.length) {
       params.roi_groups = roi.groups.map((g, gi) => {
         const quantiles = g.quantiles.slice(0, g.level_count);
@@ -1231,6 +1228,340 @@ function applyViewerTransform() {
 /* ---------------- 感兴趣区域（ROI）编辑 ---------------- */
 const roi = { editing: false, regions: [], current: [], area: null, groups: [],
               groupEditing: false, selectedGroup: null, globalSnapshot: null, groupPick: new Set() };
+const sam = { prompts: [], result: null, busy: false, version: 0, message: "",
+              multi: false, pending: false, timer: null, requestVersion: null, confirmVersion: null, scribbles: [] };
+const linePrompt = { held: false, stroke: null, cursor: null, ignorePointerUp: false };
+
+function serializeRoiRegion(region) {
+  return {
+    hull: region.hull.map((p) => [p.lon, p.lat]),
+    holes: (region.holes || []).map((h) => h.map((p) => [p.lon, p.lat])),
+    points: region.points.map((p) => [p.lon, p.lat]),
+    source: region.source || "manual",
+    model_id: region.model_id || null,
+    postprocess: region.postprocess || null,
+    scribble_count: (region.scribbles || []).length,
+    point_labels: region.source === "sam" ? region.points.map((p) => p.label) : [],
+  };
+}
+
+function samMode() { return $("roi-method").value === "sam"; }
+
+function initSamModels() {
+  const select = $("sam-model");
+  select.innerHTML = "";
+  (state.config.sam_models || []).forEach((model) => {
+    const option = document.createElement("option");
+    option.value = model.id;
+    option.textContent = model.label + (model.available ? "" : "（缺少依赖）");
+    option.title = model.filename + (model.reason ? " · " + model.reason : "");
+    option.disabled = !model.available;
+    select.appendChild(option);
+  });
+  const ready = Array.from(select.options).find((o) => !o.disabled);
+  select.value = ready ? ready.value : "";
+}
+
+function changeSamModel() {
+  sam.version++;
+  sam.result = null;
+  sam.confirmVersion = null;
+  sam.message = "已切换模型，将使用当前提示点自动识别";
+  scheduleSamPrediction();
+  drawRoi();
+}
+
+function samPostprocess() {
+  return { fill_holes: $("sam-fill-holes").checked,
+           max_hole_area_m2: Number($("sam-hole-area").value),
+           smooth_boundary: $("sam-smooth-boundary").checked,
+           ignore_small_boundaries: $("sam-ignore-boundaries").checked,
+           max_gap_width_m: Number($("sam-gap-width").value) };
+}
+
+function changeSamPostprocess() {
+  sam.version++;
+  sam.result = null;
+  sam.confirmVersion = null;
+  scheduleSamPrediction();
+  drawRoi();
+}
+
+function scheduleSamPrediction() {
+  clearTimeout(sam.timer);
+  sam.timer = null;
+  sam.pending = sam.prompts.some((p) => p.label === 1);
+  if (!sam.pending || sam.multi || sam.busy || linePrompt.held || linePrompt.stroke || !roi.editing || !samMode()) return;
+  sam.timer = setTimeout(() => { sam.timer = null; predictSamRegion(); }, 80);
+}
+
+function releaseSamMulti() {
+  if (!sam.multi) return;
+  sam.multi = false;
+  if (sam.pending) scheduleSamPrediction();
+  updateSamControls();
+}
+
+function handleSamKeyDown(e) {
+  const key = e.key.toLowerCase();
+  if (!["m", "b"].includes(key) || e.ctrlKey || e.altKey || e.metaKey
+      || e.target.closest?.("input,select,textarea,[contenteditable='true']")
+      || !roi.editing || !samMode() || state.currentView !== "input") return;
+  e.preventDefault();
+  if (key === "b") {
+    if (sam.multi) return;
+    sam.confirmVersion = null;
+    linePrompt.held = true;
+    drawRoi();
+    return;
+  }
+  if (linePrompt.held) return;
+  sam.confirmVersion = null;
+  clearTimeout(sam.timer);
+  sam.timer = null;
+  sam.multi = true;
+  updateSamControls();
+}
+
+function handleSamKeyUp(e) {
+  if (e.key.toLowerCase() === "m") releaseSamMulti();
+  if (e.key.toLowerCase() === "b") releaseSamLine();
+}
+
+function linePoint(e) {
+  const rect = $("viewer-stage").getBoundingClientRect();
+  const x = (e.clientX - rect.left - viewer.tx) / viewer.scale;
+  const y = (e.clientY - rect.top - viewer.ty) / viewer.scale;
+  return x >= 0 && y >= 0 && x <= viewer.naturalW && y <= viewer.naturalH ? [x, y] : null;
+}
+
+function beginSamLine(e) {
+  if (sam.busy || sam.pending || !sam.result) {
+    toast("请先等待蓝色待确认区域生成；已确认区域可先撤回再修复", true);
+    return;
+  }
+  if (sam.scribbles.length >= 63) { toast("划线提示已达 63 条，请先撤销不需要的线", true); return; }
+  const point = linePoint(e);
+  if (!point) return;
+  sam.version++;
+  sam.confirmVersion = null;
+  linePrompt.ignorePointerUp = true;
+  linePrompt.stroke = { points: [point] };
+  linePrompt.cursor = point;
+  drawRoi();
+}
+
+function moveSamLine(e) {
+  linePrompt.cursor = linePoint(e);
+  if (linePrompt.stroke && !linePrompt.cursor) { finishSamLine(); return; }
+  if (linePrompt.stroke && linePrompt.cursor) {
+    const last = linePrompt.stroke.points.at(-1);
+    if (Math.hypot(last[0] - linePrompt.cursor[0], last[1] - linePrompt.cursor[1]) >= 1 / viewer.scale) {
+      linePrompt.stroke.points.push(linePrompt.cursor);
+    }
+  }
+  drawRoi();
+}
+
+function finishSamLine() {
+  if (!linePrompt.stroke) return;
+  const stroke = linePrompt.stroke;
+  linePrompt.stroke = null;
+  if (stroke.points.length < 2) { sam.message = "请按住 B 并拖动鼠标画线"; drawRoi(); return; }
+  if (sam.scribbles.reduce((total, item) => total + item.points.length, stroke.points.length) > 20000) {
+    sam.message = "划线路径过长，请撤销部分线提示";
+    drawRoi();
+    return;
+  }
+  sam.scribbles.push(stroke);
+  sam.confirmVersion = null;
+  sam.message = "已添加划线保留提示，正在重新识别";
+  // 松开鼠标即提交模型推理，即使仍按住 B 也生效。
+  return predictSamRegion();
+}
+
+function releaseSamLine() {
+  linePrompt.held = false;
+  linePrompt.cursor = null;
+  const finishing = finishSamLine();
+  if (sam.pending) scheduleSamPrediction();
+  drawRoi();
+  return finishing;
+}
+
+function confirmSamRegion() {
+  updateSamControls();
+  if (sam.multi || linePrompt.held || !roi.editing || !samMode()) return;
+  if (linePrompt.stroke) return;
+  if (sam.result && !sam.busy && !sam.pending) { acceptSamRegion(); return; }
+  if (!sam.prompts.some((p) => p.label === 1)) return;
+  // 识别尚未完成时记录本次确认，只允许同一版提示结果完成后加入。
+  sam.confirmVersion = sam.version;
+  if (!sam.busy || sam.requestVersion !== sam.version) scheduleSamPrediction();
+  updateSamControls();
+}
+
+function handleSamContextMenu(e) {
+  if (!roi.editing || state.currentView !== "input") return;
+  e.preventDefault();
+  if (linePrompt.held || linePrompt.stroke) return;
+  if (!samMode()) { finalizeCurrentRegion(); return; }
+  if (sam.multi) {
+    const rect = $("viewer-stage").getBoundingClientRect();
+    addSamPoint((e.clientX - rect.left - viewer.tx) / viewer.scale,
+                (e.clientY - rect.top - viewer.ty) / viewer.scale, true);
+  } else confirmSamRegion();
+}
+
+function samExcluded() {
+  return roi.regions.map((r) => ({
+    hull: r.hull.map((p) => [p.x, p.y]),
+    holes: (r.holes || []).map((h) => h.map((p) => [p.x, p.y])),
+  }));
+}
+
+function clearSam() {
+  linePrompt.held = false;
+  linePrompt.stroke = null;
+  linePrompt.cursor = null;
+  sam.scribbles = [];
+  clearTimeout(sam.timer);
+  sam.timer = null;
+  sam.pending = false;
+  sam.confirmVersion = null;
+  sam.version++;
+  sam.prompts = [];
+  sam.result = null;
+  sam.message = "";
+  updateSamControls();
+}
+
+function updateSamControls() {
+  if (sam.result && sam.result.model_id && sam.result.model_id !== $("sam-model").value) {
+    sam.result = null;
+    sam.message = "模型已变化，请重新生成";
+  }
+  if (sam.result && sam.result.preview_id !== (state.session && state.session.preview_id)) {
+    sam.result = null;
+    sam.message = "预览图已变化，请重新生成";
+  }
+  if (sam.result && sam.result.excludedKey !== JSON.stringify(samExcluded())) {
+    sam.result = null;
+    sam.message = "区域列表已变化，请重新生成";
+  }
+  if (sam.result && sam.result.optionsKey !== JSON.stringify(samPostprocess())) {
+    sam.result = null;
+    sam.message = "处理选项已变化，正在重新识别";
+  }
+  const on = samMode();
+  $("sam-controls").classList.toggle("hidden", !on);
+  $("roi-edit-hint").textContent = on
+    ? "点击后自动识别 · 右键确认 · 按住 m 添加正负点 · 按住 B＋左键划线提示模型修补 · 点击同类点删除"
+    : "左键标点自动构成凸包 · 点击已有点删除 · 右键完成当前区域 · 撤销可恢复已完成区域";
+  $("sam-hole-area").disabled = !$("sam-fill-holes").checked;
+  $("sam-gap-width").disabled = !$("sam-ignore-boundaries").checked;
+  $("viewer-stage").classList.toggle("line-mode", on && linePrompt.held);
+  $("btn-roi-undo").textContent = sam.scribbles.length ? "撤销上一条线提示" : "撤销上一点";
+  $("btn-sam-predict").disabled = sam.busy || sam.multi || linePrompt.held || !$("sam-model").value || !sam.prompts.some((p) => p.label === 1);
+  $("btn-sam-accept").disabled = sam.busy || sam.multi || sam.pending || linePrompt.held || !sam.result;
+  $("btn-sam-predict").textContent = sam.busy ? "正在识别…" : "重新识别";
+  $("sam-status").textContent = linePrompt.held && !sam.busy ? "划线提示：在希望保留的位置画线，松开鼠标重新识别，松开 B 后右键确认"
+    : sam.multi ? "正在添加多个提示点，松开 m 后自动识别"
+    : sam.busy ? (sam.confirmVersion === sam.version ? "识别完成后将自动确认当前区域" : "正在读取原始影像并识别边界，首次加载模型需要等待")
+    : sam.message;
+}
+
+function addSamPoint(x, y, negative = null) {
+  if (linePrompt.stroke) return;
+  if (x < 0 || y < 0 || x >= viewer.naturalW || y >= viewer.naturalH) return;
+  const hit = sam.prompts.findIndex((p) => Math.hypot(p.x - x, p.y - y) <= 10 / viewer.scale);
+  const label = negative == null ? Number($("sam-label").value) : negative ? 0 : 1;
+  if (label === 1 && roi.regions.some((r) => pointInRegion({ x, y }, r))) {
+    toast("保留点落在已完成区域内，请选择其他位置", true);
+    return;
+  }
+  sam.version++;
+  sam.result = null;
+  sam.confirmVersion = null;
+  sam.message = "提示点已变化，将自动识别";
+  if (hit >= 0 && sam.prompts[hit].label === label) sam.prompts.splice(hit, 1);
+  else if (hit >= 0) sam.prompts[hit].label = label;
+  else sam.prompts.push({ x, y, label });
+  if (!sam.prompts.some((p) => p.label === 1)) sam.message = "请添加至少一个保留点";
+  scheduleSamPrediction();
+  drawRoi();
+}
+
+async function predictSamRegion() {
+  if (sam.busy || sam.multi || linePrompt.stroke || !roi.editing || !samMode() || state.currentView !== "input") return;
+  clearTimeout(sam.timer);
+  sam.timer = null;
+  sam.pending = false;
+  if (!sam.prompts.some((p) => p.label === 1)) return;
+  const version = sam.version;
+  const previewId = state.session.preview_id;
+  const modelId = $("sam-model").value;
+  if (!modelId) { toast("未发现可用分割模型", true); return; }
+  const excluded = samExcluded();
+  const excludedKey = JSON.stringify(excluded);
+  const postprocess = samPostprocess();
+  if (postprocess.fill_holes && (!Number.isFinite(postprocess.max_hole_area_m2) || postprocess.max_hole_area_m2 <= 0)) {
+    sam.message = "去洞最大面积必须大于 0，单位为平方米";
+    drawRoi();
+    return;
+  }
+  if (!postprocess.fill_holes && (!Number.isFinite(postprocess.max_hole_area_m2) || postprocess.max_hole_area_m2 <= 0)) postprocess.max_hole_area_m2 = 10;
+  const validWidth = Number.isFinite(postprocess.max_gap_width_m) && postprocess.max_gap_width_m > 0 && postprocess.max_gap_width_m <= 5;
+  if (postprocess.ignore_small_boundaries && !validWidth) {
+    sam.message = "细小分隔宽度阈值必须大于 0 且不超过 5 米";
+    drawRoi();
+    return;
+  }
+  if (!postprocess.ignore_small_boundaries && !validWidth) postprocess.max_gap_width_m = 0.2;
+  const optionsKey = JSON.stringify(samPostprocess());
+  const points = sam.prompts.map((p) => ({ ...p }));
+  sam.requestVersion = version;
+  sam.busy = true;
+  sam.result = null;
+  drawRoi();
+  try {
+    const result = await api("/api/roi/sam", { preview_id: previewId, model_id: modelId, points, excluded, postprocess,
+                                            scribbles: sam.scribbles.map((r) => ({points:r.points.map((p) => p.slice())})) });
+    if (version !== sam.version || !roi.editing || !samMode() || state.session.preview_id !== previewId || $("sam-model").value !== modelId) return;
+    if (excludedKey !== JSON.stringify(samExcluded()) || optionsKey !== JSON.stringify(samPostprocess())) {
+      sam.message = "区域列表已变化，请重新生成";
+      return;
+    }
+    sam.result = { ...result, excludedKey, optionsKey };
+    sam.message = `${result.model_label || ""}基于原始影像识别到 ${result.regions.length} 个区域${result.elapsed_seconds != null ? `，耗时 ${result.elapsed_seconds} 秒` : ""}，请检查边界后确认`;
+  } catch (err) {
+    if (version === sam.version) { sam.message = err.message; toast(err.message, true); }
+  } finally {
+    sam.busy = false;
+    drawRoi();
+    if (sam.pending && !sam.multi) scheduleSamPrediction();
+    else if (sam.result && sam.confirmVersion === version && version === sam.version && !sam.multi) acceptSamRegion();
+  }
+}
+
+function acceptSamRegion() {
+  updateSamControls();
+  if (!sam.result || sam.busy || sam.multi || sam.pending || linePrompt.held || linePrompt.stroke || !roi.editing || !samMode() || state.currentView !== "input") return;
+  const result = sam.result;
+  result.regions.forEach((r) => roi.regions.push({ ...r, source: "sam", model_id: result.model_id,
+    model_label: result.model_label, postprocess: result.postprocess || samPostprocess(),
+    scribbles: sam.scribbles.slice(),
+    points: result.points.map((p) => ({ ...p })) }));
+  clearSam();
+  drawRoi();
+  updateRoiPanel();
+  refreshRoiArea();
+  toast(`已加入 ${result.regions.length} 个自动区域，可继续标下一个区域`);
+}
+
+function pointInRegion(point, region) {
+  return pointInPolygon(point, region.hull) && !(region.holes || []).some((h) => pointInPolygon(point, h));
+}
 
 /* 读取当前控件中的分级与施肥设置（全局快照与分组值共用同一形态） */
 function captureControlSettings() {
@@ -1324,7 +1655,7 @@ async function refreshRoiArea() {
   if (roi.regions.length && state.session && state.session.has_input_preview) {
     try {
       const data = await api("/api/roi/area", {
-        regions: roi.regions.map((r) => ({ hull: r.hull.map((p) => [p.lon, p.lat]) })),
+        regions: roi.regions.map(serializeRoiRegion),
       });
       roi.area = { area_m2: data.area_m2, area_mu: data.area_mu };
     } catch (err) { /* 面积计算失败不打断编辑；运行结果中会重算 */ }
@@ -1352,6 +1683,7 @@ function remapGroupsAfterRegionDelete(removedIdx) {
 }
 
 function resetRoi() {
+  clearSam();
   roi.editing = false;
   roi.regions = [];
   roi.current = [];
@@ -1431,7 +1763,7 @@ function addRoiPoint(x, y) {
     return;
   }
   for (let i = 0; i < roi.regions.length; i++) {
-    if (pointInPolygon({ x, y }, roi.regions[i].hull)) {
+    if (pointInRegion({ x, y }, roi.regions[i])) {
       toast(`标点落在已有区域 ${i + 1} 内部，已忽略`, true);
       return;
     }
@@ -1462,13 +1794,54 @@ function finalizeCurrentRegion() {
 }
 
 function undoRoiPoint() {
+  if (samMode() && linePrompt.stroke) { toast("请先完成当前划线再撤销"); return; }
+  if (samMode() && sam.scribbles.length) {
+    sam.scribbles.pop();
+    sam.version++;
+    sam.confirmVersion = null;
+    sam.result = null;
+    sam.message = "已撤销上一条线提示，将重新识别";
+    scheduleSamPrediction();
+    drawRoi();
+    return;
+  }
+  if (samMode() && sam.prompts.length) {
+    sam.prompts.pop();
+    sam.version++;
+    sam.result = null;
+    sam.confirmVersion = null;
+    sam.message = "提示点已撤销，将自动识别";
+    scheduleSamPrediction();
+    drawRoi();
+    return;
+  }
+  if (samMode() && sam.busy) return;
   if (roi.current.length) {
     roi.current.pop();
   } else if (roi.regions.length) {
     const last = roi.regions.pop();
     remapGroupsAfterRegionDelete(roi.regions.length);
     /* 撤回已完成区域时恢复其标点为进行中区域，可继续增删标点后重新完成 */
-    roi.current = last.points.slice();
+    if (last.source === "sam") {
+      $("roi-method").value = "sam";
+      if (last.model_id) $("sam-model").value = last.model_id;
+      clearSam();
+      sam.prompts = last.points.map((p) => ({ ...p }));
+      sam.scribbles = (last.scribbles || []).slice();
+      if (last.postprocess) {
+        $("sam-fill-holes").checked = last.postprocess.fill_holes;
+        $("sam-hole-area").value = last.postprocess.max_hole_area_m2;
+        $("sam-smooth-boundary").checked = last.postprocess.smooth_boundary;
+        $("sam-ignore-boundaries").checked = last.postprocess.ignore_small_boundaries || false;
+        $("sam-gap-width").value = last.postprocess.max_gap_width_m ?? 0.2;
+      }
+      sam.message = "已恢复提示点，将自动识别";
+      scheduleSamPrediction();
+    } else {
+      $("roi-method").value = "manual";
+      roi.current = last.points.slice();
+      clearSam();
+    }
     refreshRoiArea();
     toast(`已撤回区域 ${roi.regions.length + 1}，其标点已恢复为当前编辑区域`);
   } else {
@@ -1485,6 +1858,7 @@ function centroidOf(pts) {
 }
 
 function drawRoi() {
+  updateSamControls();
   const canvas = $("roi-canvas");
   if (canvas.classList.contains("hidden") || !canvas.width) return;
   const ctx = canvas.getContext("2d");
@@ -1502,8 +1876,8 @@ function drawRoi() {
       ctx.stroke();
     }
   };
-  const tracePoly = (pts) => {
-    ctx.beginPath();
+  const tracePoly = (pts, append = false) => {
+    if (!append) ctx.beginPath();
     ctx.moveTo(pts[0].x, pts[0].y);
     for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
     ctx.closePath();
@@ -1511,18 +1885,44 @@ function drawRoi() {
 
   roi.regions.forEach((region, idx) => {
     tracePoly(region.hull);
+    (region.holes || []).forEach((h) => tracePoly(h, true));
     ctx.fillStyle = "rgba(255, 152, 0, 0.16)";
-    ctx.fill();
+    ctx.fill("evenodd");
     ctx.lineWidth = 2.5 / s;
     ctx.strokeStyle = "#ef6c00";
     ctx.stroke();
-    drawDots(region.hull, "#fff3e0", "#e65100");
+    if (region.source !== "sam") drawDots(region.hull, "#fff3e0", "#e65100");
     const c = centroidOf(region.hull);
     ctx.font = `${15 / s}px sans-serif`;
     ctx.fillStyle = "#e65100";
     ctx.textAlign = "center";
     ctx.fillText(`区域${idx + 1}`, c.x, c.y);
   });
+
+  if (roi.editing && samMode()) {
+    if (sam.result) sam.result.regions.forEach((r) => {
+      tracePoly(r.hull);
+      (r.holes || []).forEach((h) => tracePoly(h, true));
+      ctx.fillStyle = "rgba(21, 101, 192, 0.22)";
+      ctx.fill("evenodd");
+      ctx.lineWidth = 2 / s;
+      ctx.strokeStyle = "#1565c0";
+      ctx.stroke();
+    });
+    drawDots(sam.prompts.filter((p) => p.label === 1), "#a5d6a7", "#1b5e20");
+    drawDots(sam.prompts.filter((p) => p.label === 0), "#ef9a9a", "#b71c1c");
+    for (const stroke of [...sam.scribbles, ...(linePrompt.stroke ? [linePrompt.stroke] : [])]) {
+      const points = stroke.points;
+      ctx.beginPath();
+      ctx.moveTo(points[0][0], points[0][1]);
+      for (const point of points.slice(1)) ctx.lineTo(point[0], point[1]);
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.lineWidth = 2 / s;
+      ctx.strokeStyle = "#ab47bc";
+      ctx.stroke();
+    }
+  }
 
   if (roi.current.length) {
     if (roi.current.length >= 3) {
@@ -1569,10 +1969,12 @@ function setRoiEditing(on) {
     return;
   }
   roi.editing = on;
+  if (!on) clearSam();
   $("viewer-stage").classList.toggle("editing", on);
   $("roi-toolbar").classList.toggle("hidden", !on);
   $("btn-roi-edit").textContent = on ? "✏️ 编辑中..." : "✏️ 编辑感兴趣区域";
   $("btn-roi-edit").classList.toggle("primary", on);
+  drawRoi();
 }
 
 function updateRoiControls() {
@@ -1633,8 +2035,8 @@ function updateRoiPanel() {
     const ptsText = region.points.map((p, i) => `${i + 1}.(${fmt(p)})`).join(" ");
     div.innerHTML = `
       ${cb}
-      <span class="rr-title">区域${idx + 1}</span>
-      <span class="rr-pts">凸包顶点 ${region.hull.length} / 标点 ${region.points.length}：<br>${ptsText}</span>
+      <span class="rr-title">区域${idx + 1}${region.model_label ? `<br>${escapeHtml(region.model_label)}` : ""}</span>
+      <span class="rr-pts">${region.source === "sam" ? "自动轮廓" : "凸包"}顶点 ${region.hull.length} / ${region.source === "sam" ? "提示点" : "标点"} ${region.points.length}${region.holes && region.holes.length ? ` / 空洞 ${region.holes.length}` : ""}：<br>${ptsText}</span>
       <button class="rr-del" title="删除该区域">×</button>`;
     div.querySelector(".rr-del").addEventListener("click", () => {
       roi.regions.splice(idx, 1);
@@ -1758,6 +2160,7 @@ function finishGroupEditing() {
 }
 
 function initViewer() {
+  initSamModels();
   const stage = $("viewer-stage");
 
   $("viewer-tabs").addEventListener("click", (e) => {    const btn = e.target.closest(".tab");
@@ -1768,6 +2171,7 @@ function initViewer() {
   stage.addEventListener("wheel", (e) => {
     if (!viewer.naturalW) return;
     e.preventDefault();
+    if (linePrompt.stroke) return;
     const rect = stage.getBoundingClientRect();
     const mx = e.clientX - rect.left;
     const my = e.clientY - rect.top;
@@ -1782,12 +2186,21 @@ function initViewer() {
   let dragging = false, lastX = 0, lastY = 0, downX = 0, downY = 0, movedFar = false;
   stage.addEventListener("pointerdown", (e) => {
     if (!viewer.naturalW || e.button !== 0) return;
+    linePrompt.ignorePointerUp = false;
+    if (roi.editing && samMode() && linePrompt.held && state.currentView === "input") {
+      dragging = false;
+      beginSamLine(e);
+      linePrompt.ignorePointerUp = true;
+      try { stage.setPointerCapture(e.pointerId); } catch (err) { /* 合成事件无活动指针 */ }
+      return;
+    }
     dragging = true; lastX = e.clientX; lastY = e.clientY;
     downX = e.clientX; downY = e.clientY; movedFar = false;
     stage.classList.add("dragging");
     try { stage.setPointerCapture(e.pointerId); } catch (err) { /* 合成事件无活动指针 */ }
   });
   stage.addEventListener("pointermove", (e) => {
+    if (roi.editing && samMode() && (linePrompt.held || linePrompt.stroke)) { moveSamLine(e); return; }
     if (!dragging) return;
     if (Math.abs(e.clientX - downX) + Math.abs(e.clientY - downY) > 4) movedFar = true;
     viewer.tx += e.clientX - lastX;
@@ -1798,30 +2211,65 @@ function initViewer() {
   stage.addEventListener("pointerup", (e) => {
     dragging = false;
     stage.classList.remove("dragging");
+    if (linePrompt.ignorePointerUp) {
+      linePrompt.ignorePointerUp = false;
+      if (linePrompt.stroke && linePoint(e)) moveSamLine(e);
+      return finishSamLine();
+    }
     if (roi.editing && !movedFar && state.currentView === "input" && e.button === 0) {
       const rect = stage.getBoundingClientRect();
       const mx = e.clientX - rect.left;
       const my = e.clientY - rect.top;
-      addRoiPoint((mx - viewer.tx) / viewer.scale, (my - viewer.ty) / viewer.scale);
+      const x = (mx - viewer.tx) / viewer.scale, y = (my - viewer.ty) / viewer.scale;
+      if (samMode()) addSamPoint(x, y, sam.multi ? false : e.shiftKey ? true : null);
+      else if (x >= 0 && y >= 0 && x < viewer.naturalW && y < viewer.naturalH) addRoiPoint(x, y);
     }
   });
-  stage.addEventListener("contextmenu", (e) => {
-    if (!roi.editing) return;
-    e.preventDefault();
-    finalizeCurrentRegion();
+  stage.addEventListener("pointercancel", () => {
+    dragging = false;
+    if (linePrompt.stroke) { sam.version++; sam.confirmVersion = null; }
+    linePrompt.stroke = null;
+    linePrompt.ignorePointerUp = false;
+    stage.classList.remove("dragging");
+    drawRoi();
   });
+  stage.addEventListener("pointerleave", () => {
+    if (!linePrompt.stroke) { linePrompt.cursor = null; drawRoi(); }
+  });
+  stage.addEventListener("contextmenu", handleSamContextMenu);
+  document.addEventListener("keydown", handleSamKeyDown);
+  document.addEventListener("keyup", handleSamKeyUp);
+  window.addEventListener("blur", () => { releaseSamMulti(); releaseSamLine(); });
 
   $("btn-roi-edit").addEventListener("click", () => setRoiEditing(!roi.editing));
+  $("roi-method").addEventListener("change", () => {
+    if (roi.current.length) {
+      $("roi-method").value = "manual";
+      toast("请先完成或取消当前手工区域，再切换划区方式", true);
+      return;
+    }
+    clearSam();
+    drawRoi();
+  });
+  $("btn-sam-predict").addEventListener("click", predictSamRegion);
+  $("sam-model").addEventListener("change", changeSamModel);
+  $("sam-fill-holes").addEventListener("change", changeSamPostprocess);
+  $("sam-hole-area").addEventListener("input", changeSamPostprocess);
+  $("sam-smooth-boundary").addEventListener("change", changeSamPostprocess);
+  $("sam-ignore-boundaries").addEventListener("change", changeSamPostprocess);
+  $("sam-gap-width").addEventListener("input", changeSamPostprocess);
+  $("btn-sam-accept").addEventListener("click", confirmSamRegion);
   $("btn-roi-done").addEventListener("click", () => setRoiEditing(false));
   $("btn-roi-undo").addEventListener("click", undoRoiPoint);
   $("btn-roi-clear-current").addEventListener("click", () => {
+    if (samMode()) { clearSam(); drawRoi(); return; }
     if (!roi.current.length) { toast("当前没有进行中的区域"); return; }
     roi.current = [];
     drawRoi();
     updateRoiPanel();
   });
   $("btn-roi-clear-all").addEventListener("click", () => {
-    if (!roi.regions.length && !roi.current.length) return;
+    clearSam();
     roi.regions = [];
     roi.current = [];
     roi.groups = [];

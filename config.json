@@ -45,6 +45,11 @@
     "max_pixels_long_side": 2048,
     "jpeg_quality": 88
   },
+  "sam_roi": {
+    "window_size": 2048,
+    "max_window_size": 8192,
+    "padding": 256
+  },
   "stages": {
     "1": {
       "stage_key": "seedling",

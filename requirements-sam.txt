@@ -1,0 +1,7 @@
+# 点提示分割的可选依赖；显卡版 torch 请按本机 CUDA 环境安装。
+torch>=2.0
+torchvision>=0.15
+segment-anything==1.0
+segment-anything-hq==0.3
+
+# 第三代模型单独安装，见 requirements-sam3.txt。

@@ -61,19 +61,23 @@ def raster_valid_area(path):
 def lonlat_polygons_area(polygons_lonlat):
     """经纬度多边形列表的地面总面积（UTM 平面鞋匠公式）。
 
-    polygons_lonlat: [[ [lon, lat], ... ], ...]；返回 {"area_m2", "area_mu"}。
+    支持顶点数组及包含 hull、holes 的区域字典；空洞面积从外轮廓扣除。
     """
-    polygons_lonlat = [p for p in (polygons_lonlat or []) if len(p) >= 3]
+    polygons_lonlat = [p for p in (polygons_lonlat or [])
+                       if len(p["hull"] if isinstance(p, dict) else p) >= 3]
     if not polygons_lonlat:
         return {"area_m2": 0.0, "area_mu": 0.0}
 
     first = polygons_lonlat[0]
+    if isinstance(first, dict):
+        first = first["hull"]
     center_lon = sum(float(p[0]) for p in first) / len(first)
     center_lat = sum(float(p[1]) for p in first) / len(first)
     utm = utm_crs_for(center_lon, center_lat)
 
     total_m2 = 0.0
-    for poly in polygons_lonlat:
+
+    def ring_area(poly):
         lons = [float(p[0]) for p in poly]
         lats = [float(p[1]) for p in poly]
         xs, ys = rasterio.warp.transform("EPSG:4326", utm, lons, lats)
@@ -81,7 +85,13 @@ def lonlat_polygons_area(polygons_lonlat):
         for i in range(len(xs)):
             j = (i + 1) % len(xs)
             shoelace += xs[i] * ys[j] - xs[j] * ys[i]
-        total_m2 += abs(shoelace) / 2.0
+        return abs(shoelace) / 2.0
+
+    for poly in polygons_lonlat:
+        if isinstance(poly, dict):
+            total_m2 += max(0.0, ring_area(poly["hull"]) - sum(ring_area(h) for h in poly.get("holes", [])))
+        else:
+            total_m2 += ring_area(poly)
 
     total_m2 = round(total_m2, 2)
     return {"area_m2": total_m2, "area_mu": round(total_m2 * MU_PER_SQM, 4)}

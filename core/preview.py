@@ -83,7 +83,8 @@ def _stretch_uint8_or_float(array):
     low, high = np.percentile(finite, (2, 98))
     if high <= low:
         high = low + 1.0
-    return np.clip((data - low) / (high - low) * 255.0, 0, 255).astype(np.uint8)
+    scaled = np.clip((data - low) / (high - low) * 255.0, 0, 255)
+    return np.nan_to_num(scaled, nan=0.0).astype(np.uint8)
 
 
 def generate_input_preview(preview_tif, band_paths, out_jpg, max_long_side=2048, jpeg_quality=88):
@@ -103,11 +104,13 @@ def generate_input_preview(preview_tif, band_paths, out_jpg, max_long_side=2048,
             rgb, mask, georef = None, None, None
         if rgb is not None:
             _save_jpg(rgb, mask, out_jpg, jpeg_quality)
-            return {"source": str(preview_tif), "mode": "result_preview", "georef": georef}
+            return {"source": str(preview_tif), "mode": "result_preview", "georef": georef,
+                    "source_paths": {"preview": str(Path(preview_tif).resolve())}}
 
     rgb, mask, georef = _read_composite_preview(band_paths, max_long_side)
     _save_jpg(rgb, mask, out_jpg, jpeg_quality)
-    return {"source": "B4/B3/B2 合成假彩色", "mode": "composite", "georef": georef}
+    return {"source": "B4/B3/B2 合成假彩色", "mode": "composite", "georef": georef,
+            "source_paths": {role: str(Path(band_paths[role]).resolve()) for role in ("B4", "B3", "B2")}}
 
 
 def _preview_georef(src, out_h, out_w):
@@ -118,6 +121,7 @@ def _preview_georef(src, out_h, out_w):
         "source_width": int(src.width),
         "source_height": int(src.height),
         "transform": [float(v) for v in src.transform[:6]],
+        "crs": src.crs.to_string() if src.crs else None,
     }
 
 

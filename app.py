@@ -45,6 +45,10 @@ from core.inputs import (
 from core.jobs import JobManager
 from core.prescription import resolve_mapping, write_prescription_raster, write_resampled_prescription
 from core.roi import polygons_lonlat_to_pixel
+from core.sam_roi import SamRoiService, validate_prompts
+from core.sam_window import predict_tiff_roi
+from core.sam_postprocess import validate_postprocess
+from core.sam_scribble import validate_scribbles
 
 import rasterio
 
@@ -66,6 +70,7 @@ app.json.ensure_ascii = False
 
 _job_manager = JobManager()
 _state_lock = threading.Lock()
+_sam_service = SamRoiService(BASE_DIR / "checkpoint")
 
 
 class SessionState:
@@ -142,6 +147,7 @@ def session_payload():
         "validation": validation,
         "has_input_preview": input_preview is not None,
         "georef": input_preview.get("georef") if input_preview else None,
+        "preview_id": input_preview.get("preview_id") if input_preview else None,
         "input_area": input_preview.get("area") if input_preview else None,
         "busy": _job_manager.is_running(),
     }
@@ -149,6 +155,7 @@ def session_payload():
 
 def _attach_input_area(info, band_paths):
     """给整体预览信息附带影像有效范围面积（整体预览图下方展示）。"""
+    info["preview_id"] = uuid.uuid4().hex
     try:
         info["area"] = stats_core.raster_valid_area(band_paths["B2"])
     except Exception as exc:  # noqa: BLE001 - 面积统计失败不阻塞预览
@@ -216,6 +223,7 @@ def api_config():
         "stages": stages,
         "prescription": CONFIG["prescription"],
         "resampling": CONFIG["resampling"],
+        "sam_models": _sam_service.list_models(),
         "round_digits": CONFIG["defaults"].get("round_digits", 2),
         "unit": "kg/mu",
         "recognition_note": CONFIG["recognition"]["note"],
@@ -311,6 +319,8 @@ def api_upload_finish():
         SESSION.bundle.conflicts = [(r, f) for (r, f) in SESSION.bundle.conflicts if r != role]
         SESSION.bundle.files[role] = info
         SESSION.validation = None
+        SESSION.input_preview = None
+        SESSION.band_paths = None
 
     return jsonify({
         "role": role,
@@ -328,6 +338,8 @@ def api_files_remove():
     with _state_lock:
         info = SESSION.bundle.remove(role)
         SESSION.validation = None
+        SESSION.input_preview = None
+        SESSION.band_paths = None
         if info is not None and info.source == "upload":
             Path(info.path).unlink(missing_ok=True)
     return jsonify(session_payload())
@@ -345,6 +357,8 @@ def api_local_folder():
     with _state_lock:
         SESSION.bundle = bundle
         SESSION.validation = None
+        SESSION.input_preview = None
+        SESSION.band_paths = None
     payload = session_payload()
     payload["skipped"] = skipped
     payload["folder"] = str(Path(folder).resolve())
@@ -399,26 +413,130 @@ def api_validate():
 # 感兴趣区域面积（编辑完成后即时展示）
 # --------------------------------------------------------------------------
 
+def clean_roi_region(region):
+    """统一验证区域轮廓；分割来源允许凹多边形和内部空洞。"""
+    if not isinstance(region, dict):
+        raise ValueError("区域格式无效")
+
+    def clean_ring(ring):
+        if not isinstance(ring, list) or not 3 <= len(ring) <= 100000:
+            raise ValueError("区域轮廓至少需要 3 个顶点，最多 100000 个")
+        result = []
+        for point in ring:
+            if not isinstance(point, (list, tuple)) or len(point) != 2 or not _is_lonlat(*point):
+                raise ValueError("区域顶点经纬度无效")
+            result.append([float(point[0]), float(point[1])])
+        return result
+
+    source = "sam" if region.get("source") == "sam" else "manual"
+    holes = region.get("holes") or []
+    if not isinstance(holes, list) or len(holes) > 10000:
+        raise ValueError("区域空洞格式无效")
+    points = region.get("points") or []
+    if not isinstance(points, list):
+        raise ValueError("标点格式无效")
+    cleaned = {
+        "hull": clean_ring(region.get("hull")),
+        "holes": [clean_ring(h) for h in holes] if source == "sam" else [],
+        "source": source,
+        "points": [[float(p[0]), float(p[1])] for p in points
+                   if isinstance(p, (list, tuple)) and len(p) == 2 and _is_lonlat(*p)],
+    }
+    if source == "sam":
+        labels = region.get("point_labels") or []
+        if len(labels) != len(cleaned["points"]) or any(label not in (0, 1) for label in labels):
+            raise ValueError("分割提示点标签无效")
+        cleaned["point_labels"] = labels
+        if region.get("model_id"):
+            cleaned["model_id"] = str(region["model_id"])
+        if region.get("postprocess") is not None:
+            cleaned["postprocess"] = validate_postprocess(region["postprocess"])
+        count = region.get("scribble_count", 0)
+        if isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= 63:
+            raise ValueError("划线提示数量无效")
+        cleaned["scribble_count"] = count
+    return cleaned
+
+
+@app.post("/api/roi/sam")
+def api_roi_sam():
+    """按点提示预测，结果由用户确认后加入区域列表。"""
+    import numpy as np
+    from rasterio.warp import transform as project
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "请求必须是对象"}), 400
+    if _job_manager.is_running():
+        return jsonify({"error": "请等待当前影像处理任务完成再划区域"}), 409
+    with _state_lock:
+        preview = SESSION.input_preview
+    if not preview or not preview.get("georef"):
+        return jsonify({"error": "请先校验影像并生成整体预览"}), 400
+    if data.get("preview_id") != preview.get("preview_id"):
+        return jsonify({"error": "预览图已变化，请刷新后重新添加提示点"}), 409
+    g = preview["georef"]
+    try:
+        validate_prompts(data.get("points"), g["preview_width"], g["preview_height"])
+        scribbles = validate_scribbles(data.get("scribbles", []), g["preview_width"], g["preview_height"])
+        excluded = data.get("excluded") or []
+        if not isinstance(excluded, list) or len(excluded) > 1000:
+            raise ValueError("已完成区域格式无效")
+        for region in excluded:
+            if not isinstance(region, dict):
+                raise ValueError("已完成区域格式无效")
+            for ring in [region.get("hull"), *(region.get("holes") or [])]:
+                pts = np.asarray(ring, dtype=float)
+                if pts.ndim != 2 or pts.shape[1] != 2 or not 3 <= len(pts) <= 100000 or not np.isfinite(pts).all():
+                    raise ValueError("已完成区域轮廓无效")
+                if (pts < 0).any() or (pts[:, 0] > g["preview_width"]).any() or (pts[:, 1] > g["preview_height"]).any():
+                    raise ValueError("已完成区域轮廓超出预览图")
+        result = predict_tiff_roi(_sam_service, preview, data["points"], excluded,
+                                  model_id=data.get("model_id", "sam1_vit_h"),
+                                  options=CONFIG.get("sam_roi", {}), postprocess=data.get("postprocess"),
+                                  scribbles=scribbles)
+        def geographic_ring(ring):
+            xs, ys = zip(*ring)
+            sx = np.asarray(xs) * g["source_width"] / g["preview_width"]
+            sy = np.asarray(ys) * g["source_height"] / g["preview_height"]
+            a, b, c, d, e, f = g["transform"]
+            lons, lats = a * sx + b * sy + c, d * sx + e * sy + f
+            if g.get("crs"):
+                lons, lats = project(g["crs"], "EPSG:4326", lons.tolist(), lats.tolist())
+            return [{"x": float(x), "y": float(y), "lon": float(lon), "lat": float(lat)}
+                    for x, y, lon, lat in zip(xs, ys, lons, lats)]
+
+        for region in result["regions"]:
+            region["hull"] = geographic_ring(region["hull"])
+            region["holes"] = [geographic_ring(h) for h in region["holes"]]
+        # 提示点是像素位置，地理坐标取像元中心；轮廓取像元边界。
+        result["points"] = geographic_ring([
+            [min(p["x"] + 0.5, g["preview_width"] * (1 - 0.001 / g["source_width"])),
+             min(p["y"] + 0.5, g["preview_height"] * (1 - 0.001 / g["source_height"]))]
+            for p in data["points"]])
+        for point, prompt in zip(result["points"], data["points"]):
+            point.update(x=prompt["x"], y=prompt["y"], label=prompt["label"])
+    except (ValueError, TypeError, KeyError) as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:  # 模型加载、显存不足等错误不终止网页服务
+        app.logger.exception("点提示分割失败")
+        return jsonify({"error": f"点提示分割失败：{exc}"}), 503
+    with _state_lock:
+        if SESSION.input_preview is not preview:
+            return jsonify({"error": "影像已变化，分割结果已丢弃，请重新标点"}), 409
+    return jsonify({**result, "preview_id": preview["preview_id"]})
+
+
 @app.post("/api/roi/area")
 def api_roi_area():
     data = request.get_json(force=True, silent=True) or {}
     regions = data.get("regions") or []
-    hulls = []
-    for idx, region in enumerate(regions):
-        hull = (region or {}).get("hull") or []
-        try:
-            points = [[float(lon), float(lat)] for lon, lat in hull]
-        except (TypeError, ValueError):
-            return jsonify({"error": f"第 {idx + 1} 个区域顶点坐标无效"}), 400
-        if len(points) < 3:
-            return jsonify({"error": f"第 {idx + 1} 个区域顶点不足 3 个"}), 400
-        hulls.append(points)
-
     try:
-        area = stats_core.lonlat_polygons_area(hulls)
+        cleaned = [clean_roi_region(r) for r in regions]
+        area = stats_core.lonlat_polygons_area(cleaned)
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": f"面积计算失败: {exc}"}), 400
-    return jsonify({"region_count": len(hulls), **area})
+    return jsonify({"region_count": len(cleaned), **area})
 
 
 def _class_legend_items(result):
@@ -631,33 +749,21 @@ def api_run():
         roi_regions = data.get("roi_regions") or []
         cleaned_regions = []
         for idx, region in enumerate(roi_regions):
-            hull = (region or {}).get("hull") or []
-            points = (region or {}).get("points") or []
-            if len(hull) < 3:
-                return jsonify({"error": f"第 {idx + 1} 个感兴趣区域凸包顶点不足 3 个"}), 400
             try:
-                cleaned = [[[float(lon), float(lat)] for lon, lat in hull]]
+                cleaned_regions.append(clean_roi_region(region))
             except (TypeError, ValueError):
                 return jsonify({"error": f"第 {idx + 1} 个感兴趣区域顶点坐标无效"}), 400
-            cleaned_regions.append({
-                "hull": cleaned[0],
-                "points": [
-                    [float(lon), float(lat)]
-                    for lon, lat in (points or [])
-                    if _is_lonlat(lon, lat)
-                ],
-            })
         if not cleaned_regions:
             return jsonify({"error": "感兴趣区域为空，请先在预览图上标点"}), 400
 
         try:
             roi_polygons = polygons_lonlat_to_pixel(
-                [region["hull"] for region in cleaned_regions], band_transform
+                cleaned_regions, band_transform, band_crs
             )
         except Exception as exc:  # noqa: BLE001
             return jsonify({"error": f"感兴趣区域坐标换算失败: {exc}"}), 400
         try:
-            roi_area = stats_core.lonlat_polygons_area([r["hull"] for r in cleaned_regions])
+            roi_area = stats_core.lonlat_polygons_area(cleaned_regions)
         except Exception as exc:  # noqa: BLE001
             return jsonify({"error": f"感兴趣区域面积计算失败: {exc}"}), 400
         roi_meta = {
@@ -665,9 +771,9 @@ def api_run():
             "region_count": len(cleaned_regions),
             "regions": cleaned_regions,
             "area": roi_area,
-            "note": "hull 为最小凸包顶点经纬度；points 为全部标点经纬度（标注顺序）",
+            "note": "hull 为轮廓经纬度；手工区域为凸包，sam 区域保留凹边界和 holes 空洞；points 为标点，point_labels 为正负提示标签",
         }
-        job_log_roi = f"感兴趣区域制作：{len(cleaned_regions)} 个凸包区域（{roi_area['area_mu']:.2f} 亩）"
+        job_log_roi = f"感兴趣区域制作：{len(cleaned_regions)} 个区域（{roi_area['area_mu']:.2f} 亩）"
     else:
         roi_area = None
         job_log_roi = "全图制作"
@@ -850,7 +956,7 @@ def api_run():
                 g_polygons = [roi_polygons[i] for i in gdef["region_indexes"]]
                 g_regions = [cleaned_regions[i] for i in gdef["region_indexes"]]
                 try:
-                    g_area = stats_core.lonlat_polygons_area([r["hull"] for r in g_regions])
+                    g_area = stats_core.lonlat_polygons_area(g_regions)
                 except Exception:  # noqa: BLE001
                     g_area = {"area_m2": 0.0, "area_mu": 0.0}
                 g_dir = out_dir / f"group_{gi + 1}"

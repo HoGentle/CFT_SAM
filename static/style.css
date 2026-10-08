@@ -371,6 +371,9 @@ input:focus, select:focus { border-color: var(--green); }
 }
 .roi-hint { font-size: 12px; color: #8d5b00; }
 .roi-toolbar-btns { display: flex; gap: 6px; flex-wrap: wrap; }
+.roi-toolbar-btns label { display: inline-flex; align-items: center; gap: 4px; }
+#sam-hole-area, #sam-gap-width { width: 85px; }
+.viewer-stage.line-mode { cursor: crosshair; }
 details.roi-panel {
   background: var(--card); border: 1px solid var(--border); border-radius: 12px;
   padding: 10px 12px;
