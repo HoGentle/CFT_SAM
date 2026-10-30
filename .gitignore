@@ -5,3 +5,7 @@ workspace/
 *.pth
 *.pt
 *.tif
+
+outputs/
+
+patent/

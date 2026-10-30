@@ -35,6 +35,8 @@ body {
 .topbar-title { display: flex; align-items: center; gap: 14px; }
 .topbar-title .logo { font-size: 34px; }
 .topbar-title h1 { margin: 0; font-size: 20px; letter-spacing: 1px; }
+.title-row { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; }
+.title-row .btn { white-space: nowrap; }
 .subtitle { margin: 2px 0 0; font-size: 12px; opacity: .85; }
 .topbar-actions { display: flex; align-items: center; gap: 14px; }
 .status-dot {
@@ -72,6 +74,7 @@ body {
 
 /* ---------- 卡片 ---------- */
 .card {
+  flex-shrink: 0;
   background: var(--card);
   border: 1px solid var(--border);
   border-radius: 12px;
@@ -80,6 +83,11 @@ body {
 }
 .card-head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
 .card-head h2 { margin: 0; font-size: 16px; }
+summary.card-head { cursor: pointer; list-style: none; user-select: none; }
+summary.card-head::-webkit-details-marker { display: none; }
+summary.card-head::after { content: "⌄"; margin-left: auto; font-size: 20px; color: var(--muted); transition: transform .15s; }
+.card:not([open]) > .card-head { margin-bottom: 0; }
+.card:not([open]) > .card-head::after { transform: rotate(-90deg); }
 .step-no {
   width: 24px; height: 24px; border-radius: 50%;
   background: var(--green); color: #fff;
@@ -360,7 +368,11 @@ input:focus, select:focus { border-color: var(--green); }
   display: block;
 }
 #roi-canvas {
-  position: absolute; left: 0; top: 0; pointer-events: none;
+  position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 1;
+}
+#viewer-detail {
+  position: absolute; pointer-events: none; user-select: none;
+  max-width: none; image-rendering: pixelated;
 }
 
 /* ---------- ROI 编辑 ---------- */
@@ -369,6 +381,61 @@ input:focus, select:focus { border-color: var(--green); }
   padding: 7px 12px; border-top: 1px solid var(--border);
   background: #fff8e9; flex-wrap: wrap;
 }
+.region-actions { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0; }
+#card-regions .roi-toolbar {
+  display: flex; flex-direction: column; align-items: stretch; gap: 14px;
+  border: 1px solid #e6e9df; border-radius: 10px; margin-bottom: 14px; padding: 16px;
+  background: #f8faf5;
+}
+.region-intro { line-height: 1.7; margin: 0 0 12px; }
+.region-actions:not(:has(button:not(.hidden))) { display: none; }
+.roi-method-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.roi-method-label { display: flex; align-items: center; gap: 10px; font-weight: 600; min-width: 0; }
+.roi-method-label select { min-width: 0; max-width: 160px; }
+.btn.danger { color: #fff; background: #c62828; border-color: #c62828; white-space: nowrap; }
+.btn.danger:hover:not(:disabled) { color: #fff; background: #a91e1e; border-color: #a91e1e; }
+#roi-edit-hint { margin: 0; color: #66765c; font-size: 12px; line-height: 1.75; }
+.sam-settings { display: flex; flex-direction: column; gap: 14px; }
+.roi-field-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
+.roi-field { display: flex; flex-direction: column; gap: 7px; color: var(--muted); font-size: 12px; min-width: 0; }
+.roi-field select { width: 100%; min-width: 0; color: var(--text); }
+.roi-postprocess { border: 1px solid var(--border); border-radius: 8px; background: #fff; padding: 2px 12px; }
+.roi-option-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; padding: 10px 0; }
+.roi-option-row + .roi-option-row { border-top: 1px solid #edf0e9; }
+.roi-check { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.roi-check input { accent-color: var(--green); margin: 0; }
+.roi-number { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; flex-wrap: wrap; }
+.roi-number > span { display: inline-flex; align-items: center; gap: 5px; }
+.roi-number input { max-width: 76px; }
+.roi-notch-row { align-items: flex-start; }
+.roi-notch-limits { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; width: 100%; }
+.roi-notch-limits .roi-number { flex-direction: column; align-items: flex-start; gap: 6px; }
+.roi-notch-hint { width: 100%; color: var(--muted); font-size: 11px; line-height: 1.6; }
+.roi-edit-actions { border-top: 1px solid #e0e5d9; padding-top: 12px; }
+.roi-edit-actions #btn-roi-done { margin-left: auto; }
+.sam-status:empty { display: none; }
+.roi-edit-operations { margin: 12px 0; padding: 12px; border: 1px solid var(--border); border-radius: 8px; background: #fafcf9; }
+.roi-edit-operations .hint { margin: 8px 0 0; line-height: 1.7; }
+.roi-merge-distance { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+.roi-merge-distance input { width: 76px; padding: 7px 8px; }
+.roi-split-tools { border-top: 1px dashed var(--border); margin-top: 10px; padding-top: 2px; }
+.roi-split-tools .roi-toolbar-btns { margin-top: 10px; }
+.roi-region.is-picked { border-color: #ef9a9a; background: #ffebee; }
+#card-regions .roi-toolbar .sam-status { display: block; color: #526b3f; line-height: 1.7; }
+#card-regions .roi-toolbar .sam-status:empty { display: none; }
+#card-regions .roi-toolbar-btns { gap: 8px; align-items: center; }
+#card-regions .viewer-mapinfo { margin-top: 14px; }
+#card-regions .mapinfo-card { flex-direction: column; padding: 12px; }
+#card-regions .mi-actions { flex-direction: row; flex-wrap: wrap; }
+#card-regions .mi-fields { width: 100%; }
+#card-regions .mi-input { flex: 1; min-width: 0; max-width: 100%; }
+.viewer-stats-row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; padding: 8px 12px; }
+.viewer-stats-row:has(.viewer-stats:empty):has(.viewer-result-legend:empty) { display: none; }
+.viewer-result-legend { margin-left: auto; max-width: 100%; }
+.viewer-result-legend:empty { display: none; }
+.viewer-result-legend .mi-legend { align-items: flex-end; }
+.viewer-result-legend .mi-items { justify-content: flex-end; }
+.viewer-result-legend .mi-gradient { flex-wrap: wrap; justify-content: flex-end; }
 .roi-hint { font-size: 12px; color: #8d5b00; }
 .roi-toolbar-btns { display: flex; gap: 6px; flex-wrap: wrap; }
 .roi-toolbar-btns label { display: inline-flex; align-items: center; gap: 4px; }
@@ -415,7 +482,7 @@ details.roi-panel {
 /* 预览图下方统计卡片 */
 .viewer-stats {
   display: flex; align-items: stretch; gap: 8px; flex-wrap: wrap;
-  padding: 8px 12px 0;
+  padding: 0;
 }
 .viewer-stats:empty { display: none; }
 .vstat {
@@ -481,7 +548,7 @@ details.roi-panel {
   width: 160px; height: 12px; border-radius: 3px;
   border: 1px solid var(--border);
 }
-.viewer-tools { display: flex; gap: 6px; }
+.viewer-tools { display: flex; gap: 6px; flex-wrap: wrap; }
 
 /* ---------- 其他 ---------- */
 .toast {
@@ -492,3 +559,10 @@ details.roi-panel {
   max-width: 70vw;
 }
 .toast.error { background: #b71c1c; }
+
+/* 窄屏时按章节内容自然排列，避免折叠后仍占用整屏高度。 */
+@media (max-width: 1100px) {
+  .workflow { height: auto; max-height: none; }
+  .topbar { gap: 12px; padding: 14px 20px; flex-wrap: wrap; }
+  .viewer-panel { height: 75vh; }
+}

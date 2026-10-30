@@ -73,16 +73,22 @@ def _out_shape(height, width, max_long_side, allow_upscale=False):
     return max(1, int(round(height * scale))), max(1, int(round(width * scale)))
 
 
-def _stretch_uint8_or_float(array):
+def _display_limits(array):
+    """全局预览与局部细节共用色阶，避免放大或平移时亮度突变。"""
+    if array.dtype == np.uint8:
+        return (0.0, 255.0)
+    finite = array[np.isfinite(array)]
+    if finite.size == 0:
+        return (0.0, 1.0)
+    low, high = np.percentile(finite, (2, 98))
+    return (float(low), float(high) if high > low else float(low + 1))
+
+
+def _stretch_uint8_or_float(array, limits=None):
     if array.dtype == np.uint8:
         return array
     data = array.astype(np.float32)
-    finite = data[np.isfinite(data)]
-    if finite.size == 0:
-        return np.zeros_like(data, dtype=np.uint8)
-    low, high = np.percentile(finite, (2, 98))
-    if high <= low:
-        high = low + 1.0
+    low, high = limits if limits is not None else _display_limits(array)
     scaled = np.clip((data - low) / (high - low) * 255.0, 0, 255)
     return np.nan_to_num(scaled, nan=0.0).astype(np.uint8)
 
@@ -126,22 +132,25 @@ def _preview_georef(src, out_h, out_w):
 
 
 def _read_rgb_preview(path, max_long_side):
-    with rasterio.open(path) as src:
+    with rasterio.Env(GDAL_CACHEMAX=32 * 1024 * 1024, GDAL_NUM_THREADS="1"), rasterio.open(path) as src:
         out_h, out_w = _out_shape(src.height, src.width, max_long_side)
+        dtype = "uint8" if src.dtypes[0] == "uint8" else "float32"
         if src.count >= 3:
-            rgb = src.read([1, 2, 3], out_shape=(3, out_h, out_w), resampling=Resampling.average)
+            rgb = src.read([1, 2, 3], out_shape=(3, out_h, out_w), out_dtype=dtype, resampling=Resampling.average)
         else:
-            band = src.read(1, out_shape=(1, out_h, out_w), resampling=Resampling.average)
+            band = src.read(1, out_shape=(1, out_h, out_w), out_dtype=dtype, resampling=Resampling.average)
             rgb = np.repeat(band, 3, axis=0)
         mask = src.dataset_mask(out_shape=(out_h, out_w), resampling=Resampling.average) > 0
         georef = _preview_georef(src, out_h, out_w)
 
-    channels = [_stretch_uint8_or_float(rgb[i]) for i in range(3)]
+    georef["display_limits"] = [_display_limits(rgb[i]) for i in range(3)]
+    channels = [_stretch_uint8_or_float(rgb[i], georef["display_limits"][i]) for i in range(3)]
     return np.stack(channels, axis=0), mask, georef
 
 
 def _read_composite_preview(band_paths, max_long_side):
-    with rasterio.open(band_paths["B4"]) as nir, \
+    with rasterio.Env(GDAL_CACHEMAX=32 * 1024 * 1024, GDAL_NUM_THREADS="1"), \
+            rasterio.open(band_paths["B4"]) as nir, \
             rasterio.open(band_paths["B3"]) as red, \
             rasterio.open(band_paths["B2"]) as green:
         out_h, out_w = _out_shape(nir.height, nir.width, max_long_side)
@@ -153,16 +162,15 @@ def _read_composite_preview(band_paths, max_long_side):
         georef = _preview_georef(nir, out_h, out_w)
 
     rgb = np.stack([b4, b3, b2], axis=0)
-    channels = [_stretch_uint8_or_float(rgb[i]) for i in range(3)]
+    georef["display_limits"] = [_display_limits(rgb[i]) for i in range(3)]
+    channels = [_stretch_uint8_or_float(rgb[i], georef["display_limits"][i]) for i in range(3)]
     return np.stack(channels, axis=0), mask, georef
 
 
 def _save_jpg(rgb, mask, out_jpg, jpeg_quality):
-    rgb = np.stack(rgb, axis=-1)  # H W 3
-    mask = mask[..., None]
-    white = np.full_like(rgb, 255, dtype=np.uint8)
-    alpha = np.clip(mask.astype(np.float32), 0, 1)
-    composited = (rgb * alpha + white * (1 - alpha)).astype(np.uint8)
+    # 有效区掩膜只有真假两种值，直接填白，避免创建多份浮点整图。
+    composited = np.moveaxis(rgb, 0, -1).copy()
+    composited[~mask] = 255
     Image.fromarray(composited, mode="RGB").save(out_jpg, quality=jpeg_quality)
 
 

@@ -11,6 +11,9 @@ const state = {
   pollTimer: null,
   stageId: "1",
   annotated: {},
+  mode: "prescription",
+  importing: 0,
+  validating: false,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -61,8 +64,60 @@ const ROLE_LABELS = {
   preview: "整体预览图（不参与诊断）",
 };
 
+function annotationMode() { return state.mode === "annotation"; }
+
+function applySystemMode() {
+  const annotation = annotationMode();
+  $("system-title").textContent = annotation ? "水稻田块数据标注系统" : "水稻施肥处方图生成系统";
+  document.title = $("system-title").textContent;
+  $("system-subtitle").textContent = annotation ? "RGB 影像 · 田块区域标注 · 地理边界导出" : "无人机多光谱影像 · 营养诊断 · 大疆兼容处方图";
+  $("btn-system-mode").textContent = annotation ? "切换到处方图模式" : "切换到数据标注模式";
+  $("btn-system-mode").setAttribute("aria-pressed", String(annotation));
+  $("recognition-hint").textContent = annotation
+    ? "数据标注模式：只需导入一张带坐标系的 RGB 或 RGBA TIFF 影像，无需多光谱通道；导入完成后自动校验并生成预览。"
+    : "处方图模式：导入 RedEdge、Green、Red、NIR 四个通道；RGB 图用于整体预览。数据齐全后自动校验并生成预览。";
+  $("card-params").classList.toggle("hidden", annotation || !state.validated);
+  $("card-regions").classList.toggle("hidden", !state.session || !state.session.has_input_preview);
+  $("region-step-no").textContent = annotation ? "3" : "4";
+  document.querySelectorAll('#viewer-tabs [data-view]:not([data-view="input"])').forEach((tab) => tab.classList.toggle("hidden", annotation));
+  if (annotation) $("card-result").classList.add("hidden");
+  updateRunButton();
+}
+
+function invalidateInputState() {
+  state.validated = false;
+  state.result = null;
+  state.annotated = {};
+  hideResultCards();
+  resetViewer();
+  resetRoi();
+  $("card-input").open = true;
+  $("validation-actions").classList.add("hidden");
+}
+
+async function autoValidateInput() {
+  if (state.importing || state.validating || state.running || roiEdit.busy) return;
+  const files = (state.session && state.session.files) || {};
+  const ready = annotationMode() ? !!files.preview : ["B1", "B2", "B3", "B4"].every((role) => files[role]);
+  if (ready) await doValidate();
+}
+
+async function switchSystemMode() {
+  if (state.running || state.importing || state.validating || roiEdit.busy) { toast("请等待数据处理完成后切换模式", true); return; }
+  try {
+    const mode = annotationMode() ? "prescription" : "annotation";
+    state.session = await api("/api/mode", { mode });
+    state.mode = state.session.mode;
+    invalidateInputState();
+    applySystemMode();
+    renderFiles();
+    await autoValidateInput();
+  } catch (error) { toast(error.message, true); }
+}
+
 /* ---------------- 数据接入 ---------------- */
 function initInput() {
+  $("btn-system-mode").addEventListener("click", switchSystemMode);
   const dropzone = $("dropzone");
   $("btn-pick-files").addEventListener("click", (e) => { e.stopPropagation(); $("file-input").click(); });
   $("btn-pick-folder").addEventListener("click", (e) => { e.stopPropagation(); $("folder-input").click(); });
@@ -92,19 +147,22 @@ function initInput() {
   });
 
   $("btn-scan-folder").addEventListener("click", async () => {
+    if (state.running || state.importing || state.validating || roiEdit.busy) { toast("请等待当前数据处理完成", true); return; }
     const path = $("folder-path").value.trim();
     if (!path) { toast("请填写文件夹路径", true); return; }
     try {
       const data = await api("/api/local/folder", { path });
       state.session = data;
+      invalidateInputState();
       renderFiles();
-      resetRoi();
       toast(`扫描完成：${Object.keys(data.files).length} 个文件已识别`);
+      await autoValidateInput();
     } catch (err) { toast(err.message, true); }
   });
 
   $("btn-validate").addEventListener("click", doValidate);
   $("btn-reset").addEventListener("click", async () => {
+    if (roiEdit.busy) { toast("请等待区域操作完成", true); return; }
     try {
       const data = await api("/api/reset", {});
       state.session = data.session;
@@ -114,12 +172,15 @@ function initInput() {
       hideResultCards();
       resetViewer();
       resetRoi();
+      $("card-input").open = true;
+      applySystemMode();
       toast("会话已清空");
     } catch (err) { toast(err.message, true); }
   });
 }
 
 function handleFileSelection(fileList) {
+  if (state.running || state.validating || roiEdit.busy) { toast("请等待当前数据处理完成再导入影像", true); return; }
   const tifs = fileList.filter((f) => /\.(tif|tiff)$/i.test(f.name));
   const skipped = fileList.length - tifs.length;
   if (skipped > 0) toast(`已忽略 ${skipped} 个非 tif 文件`);
@@ -128,6 +189,9 @@ function handleFileSelection(fileList) {
 }
 
 async function uploadQueue(files) {
+  state.importing++;
+  state.validated = false;
+  $("btn-system-mode").disabled = true;
   const queue = $("upload-queue");
   const items = files.map((f) => {
     const div = document.createElement("div");
@@ -139,10 +203,15 @@ async function uploadQueue(files) {
     return { file: f, el: div };
   });
 
+  let failed = false;
   for (const item of items) {
-    await uploadOne(item);
+    if (!await uploadOne(item)) failed = true;
   }
   await refreshSession();
+  state.importing--;
+  $("btn-system-mode").disabled = state.importing > 0;
+  if (!failed) await autoValidateInput();
+  else $("validation-actions").classList.remove("hidden");
 }
 
 async function uploadOne({ file, el }) {
@@ -171,19 +240,23 @@ async function uploadOne({ file, el }) {
     status.textContent = "识别通道...";
     const fin = await api("/api/upload/finish", { upload_id: uploadId });
     state.session = fin.session;
-    resetRoi();
+    invalidateInputState();
     fill.style.width = "100%";
     status.textContent = `✓ ${fin.role_label || fin.role}`;
     el.classList.add("done");
+    return true;
   } catch (err) {
     status.textContent = "✗ " + err.message;
     el.classList.add("failed");
+    return false;
   }
 }
 
 async function refreshSession() {
   try {
     state.session = await api("/api/session");
+    state.mode = state.session.mode || "prescription";
+    applySystemMode();
     renderFiles();
     updateRoiControls();
     renderViewerStats();
@@ -194,7 +267,7 @@ function renderFiles() {
   const container = $("file-table");
   container.innerHTML = "";
   const s = state.session || { files: {}, conflicts: [], missing: [] };
-  const roles = ["preview", "B1", "B2", "B3", "B4"];
+  const roles = annotationMode() ? ["preview"] : ["preview", "B1", "B2", "B3", "B4"];
 
   for (const role of roles) {
     const info = s.files[role];
@@ -210,8 +283,8 @@ function renderFiles() {
       row.querySelector(".f-remove").addEventListener("click", async () => {
         try {
           state.session = await api("/api/files/remove", { role });
+          invalidateInputState();
           renderFiles();
-          resetRoi();
         } catch (err) { toast(err.message, true); }
       });
     } else if (role !== "preview") {
@@ -223,7 +296,7 @@ function renderFiles() {
       row.className = "file-row missing";
       row.innerHTML = `
         <span class="role-badge">${ROLE_LABELS[role]}</span>
-        <span class="f-name">未上传（可选，缺失时用波段合成预览）</span>`;
+        <span class="f-name">${annotationMode() ? "请导入 RGB 或 RGBA TIFF 影像" : "未上传（可选，缺失时用波段合成预览）"}</span>`;
     }
     container.appendChild(row);
   }
@@ -241,19 +314,32 @@ function renderFiles() {
 
 /* ---------------- 校验 ---------------- */
 async function doValidate() {
+  if (state.validating || state.importing || state.running || roiEdit.busy) return;
+  state.validating = true;
+  state.validated = false;
   try {
     const data = await api("/api/validate", {});
     state.session = data.session;
     renderFiles();
     renderValidation(data);
     if (!data.errors.length) {
-      $("card-params").classList.remove("hidden");
+      applySystemMode();
+      state.running = true;
+      updateRunButton();
+      $("card-progress").classList.remove("hidden");
+      $("card-progress").open = true;
       toast("校验通过，正在生成整体预览图...");
       pollJob();
     } else {
+      $("validation-actions").classList.remove("hidden");
+      $("card-input").open = true;
+      $("card-validation").open = true;
       toast("校验未通过，请检查输入", true);
     }
-  } catch (err) { toast(err.message, true); }
+  } catch (err) {
+    $("validation-actions").classList.remove("hidden");
+    toast(err.message, true);
+  } finally { state.validating = false; }
 }
 
 function renderValidation(data) {
@@ -269,7 +355,7 @@ function renderValidation(data) {
   } else {
     const div = document.createElement("div");
     div.className = "alert ok";
-    div.innerHTML = "<b>校验通过</b>，通道图同经纬度、同网格，可进行营养诊断。";
+    div.innerHTML = annotationMode() ? "<b>校验通过</b>，RGB 影像及地理参考可用于区域标注。" : "<b>校验通过</b>，通道图同经纬度、同网格，可进行营养诊断。";
     body.appendChild(div);
     state.validated = true;
   }
@@ -697,13 +783,13 @@ function readRunParams() {
 function updateRunButton() {
   const s = state.session;
   const files = (s && s.files) || {};
-  const ready = state.validated && files.B1 && files.B2 && files.B3 && files.B4;
-  $("btn-run").disabled = !ready;
+  const ready = !annotationMode() && state.validated && files.B1 && files.B2 && files.B3 && files.B4;
+  $("btn-run").disabled = !ready || state.running || state.importing > 0 || state.validating;
 }
 
 /* ---------------- 运行 ---------------- */
 async function doRun() {
-  if (state.running) { toast("已有任务正在运行", true); return; }
+  if (state.running || roiEdit.busy) { toast("已有任务正在运行", true); return; }
   if (roi.editing) {
     toast("请先退出感兴趣区域编辑模式，再开始生成", true);
     return;
@@ -769,6 +855,7 @@ async function doRun() {
   }
   try {
     $("card-progress").classList.remove("hidden");
+    $("card-progress").open = true;
     $("card-progress").scrollIntoView({ behavior: "smooth", block: "nearest" });
     await api("/api/run", params);
     state.running = true;
@@ -811,8 +898,12 @@ function renderProgress(job) {
 }
 
 async function onJobFinished(job) {
+  state.running = false;
+  updateRunButton();
   renderProgress(job);
   if (job.error) {
+    $("validation-actions").classList.remove("hidden");
+    $("card-input").open = true;
     toast("任务失败：" + job.error, true);
     return;
   }
@@ -827,13 +918,19 @@ async function onJobFinished(job) {
   } else if (result.input_preview) {
     await refreshSession();
     showPreview("input");
+    $("card-input").open = false;
+    $("card-validation").open = false;
+    $("card-progress").classList.add("hidden");
+    $("validation-actions").classList.add("hidden");
+    $("card-regions").classList.remove("hidden");
+    $("card-regions").open = true;
     toast("整体预览图已生成");
   }
 }
 
 /* ---------------- 结果 ---------------- */
 function hideResultCards() {
-  ["card-validation", "card-params", "card-progress", "card-result"].forEach((id) => $(id).classList.add("hidden"));
+  ["card-validation", "card-params", "card-regions", "card-progress", "card-result"].forEach((id) => $(id).classList.add("hidden"));
   $("btn-run").disabled = true;
   setViewerTabEnabled(false);
 }
@@ -854,6 +951,7 @@ function levelRowHtml(s, maxCount) {
 
 function renderResults(result) {
   $("card-result").classList.remove("hidden");
+  $("card-result").open = true;
   state.validated = true;
   updateRunButton();
 
@@ -919,13 +1017,90 @@ function formatNum(v) {
 
 /* ---------------- 图窗 ---------------- */
 const viewer = { scale: 1, tx: 0, ty: 0, naturalW: 0, naturalH: 0, url: null };
+const detail = { timer: null, controller: null, version: 0, url: null, ready: false };
+
+function clearViewerDetail() {
+  detail.version++;
+  clearTimeout(detail.timer);
+  if (detail.controller) detail.controller.abort();
+  detail.controller = null;
+  const img = $("viewer-detail");
+  img.hidden = true;
+  img.removeAttribute("src");
+  if (detail.url) URL.revokeObjectURL(detail.url);
+  detail.url = null;
+}
+
+function detailView() {
+  if (!detail.ready || state.currentView !== "input" || !state.session?.georef || viewer.scale <= 0) return null;
+  const stage = $("viewer-stage"), g = state.session.georef;
+  // 浏览器只保留当前视野的一张细节图，最多 200 万像素。
+  const x = Math.max(0, -viewer.tx / viewer.scale);
+  const y = Math.max(0, -viewer.ty / viewer.scale);
+  const w = Math.min(viewer.naturalW, (stage.clientWidth - viewer.tx) / viewer.scale) - x;
+  const h = Math.min(viewer.naturalH, (stage.clientHeight - viewer.ty) / viewer.scale) - y;
+  if (w <= 0 || h <= 0) return null;
+  const density = Math.min(viewer.scale * Math.min(window.devicePixelRatio || 1, 2),
+    g.source_width / viewer.naturalW, g.source_height / viewer.naturalH);
+  if (density <= 1.05) return null;
+  const factor = Math.min(1, 2048 / (w * density), 2048 / (h * density),
+    Math.sqrt(2000000 / (w * h * density * density)));
+  return { x, y, w, h, width: Math.max(1, Math.floor(w * density * factor)),
+    height: Math.max(1, Math.floor(h * density * factor)), preview_id: state.session.preview_id };
+}
+
+function scheduleViewerDetail() {
+  clearTimeout(detail.timer);
+  detail.version++;
+  if (detail.controller) detail.controller.abort();
+  const view = detailView();
+  if (!view) { clearViewerDetail(); return; }
+  const version = detail.version;
+  detail.timer = setTimeout(() => loadViewerDetail(view, version), 160);
+}
+
+async function loadViewerDetail(view, version) {
+  if (version !== detail.version) return;
+  const controller = new AbortController();
+  detail.controller = controller;
+  let url = null;
+  try {
+    const response = await fetch("/api/preview/detail?" + new URLSearchParams(view), { signal: controller.signal, cache: "no-store" });
+    if (version !== detail.version) return;
+    if (response.status === 429) {
+      detail.timer = setTimeout(() => loadViewerDetail(view, version), 350);
+      return;
+    }
+    if (!response.ok) return;
+    url = URL.createObjectURL(await response.blob());
+    const image = new Image();
+    image.src = url;
+    await image.decode();
+    if (version !== detail.version || state.session?.preview_id !== view.preview_id) return;
+    const img = $("viewer-detail");
+    Object.assign(img.style, { left: `${view.x}px`, top: `${view.y}px`, width: `${view.w}px`, height: `${view.h}px` });
+    img.src = url;
+    img.hidden = false;
+    if (detail.url) URL.revokeObjectURL(detail.url);
+    detail.url = url;
+    url = null;
+  } catch (error) {
+    // 取消或读取失败时保留整体预览，继续支持缩放和划区。
+  } finally {
+    if (url) URL.revokeObjectURL(url);
+    if (detail.controller === controller) detail.controller = null;
+  }
+}
 
 function resetViewer() {
+  detail.ready = false;
+  clearViewerDetail();
   $("viewer-img").removeAttribute("src");
   $("viewer-transform").style.display = "none";
   $("viewer-empty").style.display = "flex";
   $("viewer-legend").innerHTML = "";
   $("viewer-stats").innerHTML = "";
+  $("viewer-result-legend").innerHTML = "";
   const mi = $("viewer-mapinfo");
   mi.classList.add("hidden");
   mi.innerHTML = "";
@@ -969,19 +1144,18 @@ function showPreview(view) {
 }
 
 function setViewerImage(url, legendMode) {
+  detail.ready = false;
+  clearViewerDetail();
   const img = $("viewer-img");
   const canvas = $("roi-canvas");
   const isInputView = legendMode === "none";
   canvas.classList.toggle("hidden", !isInputView);
   img.onload = () => {
+    detail.ready = isInputView;
     viewer.naturalW = img.naturalWidth;
     viewer.naturalH = img.naturalHeight;
     $("viewer-transform").style.display = "block";
     $("viewer-empty").style.display = "none";
-    if (isInputView) {
-      canvas.width = img.naturalWidth;
-      canvas.height = img.naturalHeight;
-    }
     fitViewer();
   };
   img.src = url;
@@ -991,7 +1165,7 @@ function setViewerImage(url, legendMode) {
 function renderLegend(mode) {
   const el = $("viewer-legend");
   if (mode === "none") {
-    el.innerHTML = `<span>整体预览图（仅展示，不参与诊断计算）</span>`;
+    el.innerHTML = `<span>${annotationMode() ? "RGB 影像 · 区域标注" : "整体预览图（仅展示，不参与诊断计算）"}</span>`;
   } else if (mode === "class" || mode === "prescription") {
     /* 长势等级 / 推荐施肥量图例已移至图面注记模块（viewer-mapinfo） */
     el.innerHTML = "";
@@ -1016,6 +1190,7 @@ function statsRow(items) {
 }
 
 function renderViewerStats() {
+  $("viewer-result-legend").innerHTML = resultLegendHtml(state.currentView);
   const el = $("viewer-stats");
   const view = state.currentView;
 
@@ -1046,7 +1221,7 @@ function renderViewerStats() {
   }
 }
 
-/* 图面注记（田块面积/制图单位/制图时间，可编辑）+ 长势等级/推荐施肥量图例模块 */
+/* 区域设置中的图面注记与统计栏右侧的图例。 */
 const MAPINFO_KEY = "prescription.mapInfo";
 
 function loadMapInfo() {
@@ -1082,24 +1257,8 @@ function mapInfoDate() {
   return `${now.getFullYear()}年${now.getMonth() + 1}月${now.getDate()}日`;
 }
 
-function renderMapInfo() {
-  const el = $("viewer-mapinfo");
-  const view = state.currentView;
-  if ((view !== "class" && view !== "prescription") || !state.result) {
-    el.classList.add("hidden");
-    el.innerHTML = "";
-    return;
-  }
-  const info = loadMapInfo();
-  const areaDefault = computedFieldArea();
-  const areaDefaultText = areaDefault != null ? formatMuPlain(areaDefault) : "";
-  /* 田块面积的手动修改按 run 记录，避免上一地块的数值带到新成果里 */
-  const areaByRun = info.areaByRun || {};
-  const areaUser = state.result.run_id ? areaByRun[state.result.run_id] : null;
-  const areaText = areaUser != null && areaUser !== "" ? areaUser : areaDefaultText;
-  const unitText = info.unit != null && info.unit !== "" ? info.unit : "扬州大学";
-  const dateText = info.date != null && info.date !== "" ? info.date : mapInfoDate();
-
+function resultLegendHtml(view) {
+  if (annotationMode() || !state.result) return "";
   let legendHtml = "";
   if (view === "class" && state.result.level_stats) {
     const itemsHtml = (stats) => stats.map((lv) =>
@@ -1132,6 +1291,28 @@ function renderMapInfo() {
       </div>`;
   }
 
+  return legendHtml;
+}
+
+function renderMapInfo() {
+  const el = $("viewer-mapinfo");
+  const view = state.currentView;
+  if (annotationMode() || (view !== "class" && view !== "prescription") || !state.result) {
+    el.classList.add("hidden");
+    el.innerHTML = "";
+    return;
+  }
+  const info = loadMapInfo();
+  const areaDefault = computedFieldArea();
+  const areaDefaultText = areaDefault != null ? formatMuPlain(areaDefault) : "";
+  /* 田块面积的手动修改按 run 记录，避免上一地块的数值带到新成果里 */
+  const areaByRun = info.areaByRun || {};
+  const areaUser = state.result.run_id ? areaByRun[state.result.run_id] : null;
+  const areaText = areaUser != null && areaUser !== "" ? areaUser : areaDefaultText;
+  const unitText = info.unit != null && info.unit !== "" ? info.unit : "扬州大学";
+  const dateText = info.date != null && info.date !== "" ? info.date : mapInfoDate();
+
+
   el.innerHTML = `
     <div class="mapinfo-card">
       <div class="mi-fields">
@@ -1139,7 +1320,6 @@ function renderMapInfo() {
         <div class="mi-line"><label>制图单位：</label><input class="mi-input mi-unit" value="${escapeHtml(unitText)}" placeholder="如：扬州大学"></div>
         <div class="mi-line"><label>制图时间：</label><input class="mi-input mi-date" value="${escapeHtml(dateText)}" placeholder="如：2025年8月7日"></div>
       </div>
-      ${legendHtml}
       <div class="mi-actions">
         <button class="btn tiny" type="button" data-act="embed" title="把注记与图例绘制到预览图上">🖼 嵌入预览图</button>
         <button class="btn tiny" type="button" data-act="download" title="下载嵌入注记后的预览图">⬇ 下载</button>
@@ -1153,13 +1333,15 @@ function renderMapInfo() {
       info.areaByRun = areaByRun;
     }
     saveMapInfo(info);
+    delete state.annotated[view];
   });
-  el.querySelector(".mi-unit").addEventListener("input", (e) => { info.unit = e.target.value; saveMapInfo(info); });
-  el.querySelector(".mi-date").addEventListener("input", (e) => { info.date = e.target.value; saveMapInfo(info); });
+  el.querySelector(".mi-unit").addEventListener("input", (e) => { info.unit = e.target.value; saveMapInfo(info); delete state.annotated[view]; });
+  el.querySelector(".mi-date").addEventListener("input", (e) => { info.date = e.target.value; saveMapInfo(info); delete state.annotated[view]; });
 
   async function ensureAnnotated() {
     const data = await api("/api/preview/annotate", {
-      view, area: areaText, unit: unitText, date: dateText,
+      view, area: el.querySelector(".mi-area").value,
+      unit: el.querySelector(".mi-unit").value, date: el.querySelector(".mi-date").value,
     });
     state.annotated[view] = data;
     return data;
@@ -1190,21 +1372,10 @@ function renderMapInfo() {
   });
 }
 
-/* 左栏高度同步：当右侧出现额外信息条（诊断图/处方图注记卡片）或 ROI 列表
-   展开使右栏变高时，把左栏拉升到与右栏齐平（内容更长时用自身滑条滚动） */
+/* 两栏各自滚动，区域设置折叠不改变图窗高度。 */
 function syncLeftColumnHeight() {
-  const wf = document.querySelector(".workflow");
-  const col = document.querySelector(".viewer-column");
-  if (!wf || !col) return;
-  const infoVisible = !$("viewer-mapinfo").classList.contains("hidden");
-  if (infoVisible) {
-    /* 显式高度需同时解除 CSS 最小高度限制，右栏不足一屏时也能齐平 */
-    wf.style.height = col.offsetHeight + "px";
-    wf.style.minHeight = "0";
-  } else {
-    wf.style.height = "";
-    wf.style.minHeight = "";
-  }
+  const workflow = document.querySelector(".workflow");
+  if (workflow) { workflow.style.height = ""; workflow.style.minHeight = ""; }
 }
 
 function fitViewer() {
@@ -1220,9 +1391,16 @@ function fitViewer() {
   applyViewerTransform();
 }
 
+function viewerMaxScale() {
+  const g = state.currentView === "input" && state.session?.georef;
+  return g ? Math.max(60, 4 * g.source_width / Math.max(1, viewer.naturalW),
+    4 * g.source_height / Math.max(1, viewer.naturalH)) : 60;
+}
+
 function applyViewerTransform() {
   $("viewer-transform").style.transform = `translate(${viewer.tx}px, ${viewer.ty}px) scale(${viewer.scale})`;
   drawRoi();
+  scheduleViewerDetail();
 }
 
 /* ---------------- 感兴趣区域（ROI）编辑 ---------------- */
@@ -1231,9 +1409,137 @@ const roi = { editing: false, regions: [], current: [], area: null, groups: [],
 const sam = { prompts: [], result: null, busy: false, version: 0, message: "",
               multi: false, pending: false, timer: null, requestVersion: null, confirmVersion: null, scribbles: [] };
 const linePrompt = { held: false, stroke: null, cursor: null, ignorePointerUp: false };
+const roiEdit = { selected: new Set(), splitting: false, guide: [], busy: false, version: 0, frame: null, lastFrame: 0 };
+
+function regionParts(region) { return region.parts && region.parts.length ? region.parts : [region]; }
+
+function updateRoiEditControls() {
+  const count = roiEdit.selected.size;
+  const pending = roi.current.length || sam.prompts.length || sam.scribbles.length;
+  const ready = roi.editing && state.currentView === "input" && !roiEdit.busy && !roi.exporting && !sam.busy && !pending;
+  $("btn-roi-export").disabled = roiEdit.busy || !!roi.exporting || !roi.regions.length;
+  $("btn-roi-merge").disabled = !ready || count < 2;
+  $("btn-roi-split").disabled = !ready || count !== 1;
+  $("roi-merge-distance").disabled = roiEdit.busy;
+  $("roi-split-tools").classList.toggle("hidden", !roiEdit.splitting);
+  $("btn-roi-split-run").disabled = !ready || count !== 1;
+  $("roi-selection-status").textContent = roiEdit.busy ? "正在读取原始影像并处理，请稍候…"
+    : count ? `已选 ${count} 个区域：${Array.from(roiEdit.selected).sort((a,b)=>a-b).map(i=>i+1).join("、")}；Ctrl＋点击可取消选择`
+    : "编辑时按住 Ctrl 点击区域可多选；选中多个区域后按 H 合并。";
+  $("roi-split-status").textContent = roiEdit.guide.length
+    ? `已添加 ${roiEdit.guide.length} 个折线点，按回车沿折线寻找边界；Ctrl+Z 撤销折线点。`
+    : "直接按回车自动寻找边界；也可左键添加折线点，再按回车沿线寻找边界。";
+}
+
+function clearRoiEditSelection() {
+  roiEdit.selected.clear();
+  roiEdit.splitting = false;
+  roiEdit.guide = [];
+  updateRoiEditControls();
+}
+
+function toggleRoiSelection(point) {
+  if (roiEdit.busy || !roi.editing) return;
+  const index = roi.regions.findIndex(region => pointInRegion(point, region));
+  if (index < 0) return;
+  if (roiEdit.selected.has(index)) roiEdit.selected.delete(index);
+  else roiEdit.selected.add(index);
+  roiEdit.guide = [];
+  updateRoiEditControls();
+  drawRoi();
+  updateRoiPanel();
+}
+
+function queueRoiSelectionFrame() {
+  if (roiEdit.frame != null || !roi.editing || !roiEdit.selected.size || state.currentView !== "input"
+      || typeof requestAnimationFrame !== "function") return;
+  roiEdit.frame = requestAnimationFrame(time => {
+    roiEdit.frame = null;
+    if (time - roiEdit.lastFrame >= 45) { roiEdit.lastFrame = time; drawRoi(true); }
+    else queueRoiSelectionFrame();
+  });
+}
+
+function replaceRoiRegions(indices, replacements) {
+  const selected = new Set(indices), anchor = Math.min(...indices);
+  const mapping = new Map(), next = [];
+  roi.regions.forEach((region, index) => {
+    if (index === anchor) { mapping.set(index, next.length); next.push(replacements[0]); }
+    else if (!selected.has(index)) { mapping.set(index, next.length); next.push(region); }
+  });
+  const appended = replacements.slice(1).map(region => { const index = next.length; next.push(region); return index; });
+  roi.groups.forEach(group => {
+    const inherits = group.regions.includes(anchor);
+    group.regions = Array.from(new Set(group.regions.filter(i => mapping.has(i)).map(i => mapping.get(i))));
+    if (inherits) group.regions.push(...appended);
+  });
+  roi.groupPick = new Set(Array.from(roi.groupPick).filter(i => mapping.has(i)).map(i => mapping.get(i)));
+  roi.regions = next;
+  roiEdit.selected = new Set([mapping.get(anchor), ...appended]);
+  roiEdit.splitting = false;
+  roiEdit.guide = [];
+  clearSam();
+  drawRoi();
+  updateRoiPanel();
+  refreshRoiArea();
+}
+
+async function runRoiEdit(operation) {
+  const indices = Array.from(roiEdit.selected).sort((a,b)=>a-b);
+  if (roiEdit.busy || roi.exporting || sam.busy || !roi.editing || state.currentView !== "input") return;
+  if ((operation === "merge" && indices.length < 2) || (operation === "split" && indices.length !== 1)) return;
+  if (roi.current.length || sam.prompts.length || sam.scribbles.length) { toast("请先完成或取消当前标注区域", true); return; }
+  if (operation === "split" && roiEdit.guide.length === 1) { toast("折线至少需要两个点，也可清除折线后自动寻找边界", true); return; }
+  const distanceInput = $("roi-merge-distance").value.trim();
+  const mergeDistance = Number(distanceInput);
+  if (operation === "merge" && (!distanceInput || !Number.isFinite(mergeDistance) || (mergeDistance < 0 && mergeDistance !== -1))) {
+    toast("最大合并距离须为非负数，或 -1（不限距离）", true); return;
+  }
+  const original = roi.regions, snapshot = original.slice(), previewId = state.session.preview_id;
+  const version = ++roiEdit.version;
+  roiEdit.busy = true;
+  updateRoiEditControls();
+  drawRoi();
+  try {
+    const result = await api("/api/roi/edit", { operation, preview_id: previewId,
+      regions: indices.map(i => ({parts: regionParts(original[i]).map(part => ({
+        hull: part.hull.map(p=>[p.x,p.y]), holes:(part.holes||[]).map(h=>h.map(p=>[p.x,p.y])) }))})),
+      guide: operation === "split" ? roiEdit.guide.map(p=>[p.x,p.y]) : [],
+      ...(operation === "merge" ? {merge_max_distance_m: mergeDistance,
+        excluded_regions: original.filter((_,i)=>!roiEdit.selected.has(i)).map(region=>({parts:regionParts(region).map(part=>({
+          hull:part.hull.map(p=>[p.x,p.y]), holes:(part.holes||[]).map(h=>h.map(p=>[p.x,p.y]))}))}))} : {}),
+    });
+    if (version !== roiEdit.version || state.session.preview_id !== previewId || roi.regions !== original
+        || roi.regions.length !== snapshot.length || snapshot.some((r,i)=>roi.regions[i]!==r)) return;
+    replaceRoiRegions(indices, result.regions);
+    toast(operation === "merge" ? `已合并为区域 ${indices[0]+1}` : `已分割为 ${result.regions.length} 个区域，新区域已追加至列表末尾`);
+  } catch (error) { if (version === roiEdit.version) toast(error.message, true); }
+  finally {
+    if (version === roiEdit.version) { roiEdit.busy = false; drawRoi(); updateRoiEditControls(); }
+  }
+}
+
+function beginRoiSplit() {
+  if (roiEdit.selected.size !== 1 || roiEdit.busy || !roi.editing) return;
+  if (roi.current.length || sam.prompts.length || sam.scribbles.length) { toast("请先完成或取消当前标注区域", true); return; }
+  roiEdit.splitting = true;
+  roiEdit.guide = [];
+  updateRoiEditControls();
+  $("roi-split-tools").scrollIntoView({behavior:"smooth",block:"nearest"});
+  drawRoi();
+}
+
+function handleRoiEditKeyDown(e) {
+  if (!roi.editing || state.currentView !== "input" || roiEdit.busy || e.ctrlKey || e.metaKey || e.altKey
+      || e.target.closest?.("input,select,textarea,[contenteditable]:not([contenteditable='false'])")) return;
+  const key = e.key.toLowerCase();
+  if (key === "h" && roiEdit.selected.size > 1 && !e.repeat) { e.preventDefault(); runRoiEdit("merge"); }
+  else if (key === "enter" && roiEdit.splitting && roiEdit.selected.size === 1 && !e.repeat) { e.preventDefault(); runRoiEdit("split"); }
+  else if (key === "escape" && roiEdit.splitting) { e.preventDefault(); roiEdit.splitting = false; roiEdit.guide = []; drawRoi(); }
+}
 
 function serializeRoiRegion(region) {
-  return {
+  const serialized = {
     hull: region.hull.map((p) => [p.lon, p.lat]),
     holes: (region.holes || []).map((h) => h.map((p) => [p.lon, p.lat])),
     points: region.points.map((p) => [p.lon, p.lat]),
@@ -1243,6 +1549,15 @@ function serializeRoiRegion(region) {
     scribble_count: (region.scribbles || []).length,
     point_labels: region.source === "sam" ? region.points.map((p) => p.label) : [],
   };
+  if (region.parts) serialized.parts = region.parts.map(part => ({
+    hull: part.hull.map(p=>[p.lon,p.lat]), holes:(part.holes||[]).map(h=>h.map(p=>[p.lon,p.lat])) }));
+  const g = state.session && state.session.georef;
+  if (serialized.source === "manual" && g && g.crs && g.crs !== "EPSG:4326") {
+    serialized.pixel_hull = region.hull.map((p) => [p.x, p.y]);
+    serialized.pixel_points = region.points.map((p) => [p.x, p.y]);
+    serialized.preview_id = state.session.preview_id;
+  }
+  return serialized;
 }
 
 function samMode() { return $("roi-method").value === "sam"; }
@@ -1276,7 +1591,10 @@ function samPostprocess() {
            max_hole_area_m2: Number($("sam-hole-area").value),
            smooth_boundary: $("sam-smooth-boundary").checked,
            ignore_small_boundaries: $("sam-ignore-boundaries").checked,
-           max_gap_width_m: Number($("sam-gap-width").value) };
+           max_gap_width_m: Number($("sam-gap-width").value),
+           fill_small_notches: $("sam-fill-notches").checked,
+           max_notch_width_m: Number($("sam-notch-width").value),
+           max_notch_area_m2: Number($("sam-notch-area").value) };
 }
 
 function changeSamPostprocess() {
@@ -1302,11 +1620,19 @@ function releaseSamMulti() {
   updateSamControls();
 }
 
+function handleRoiUndoKeyDown(e) {
+  if (e.key.toLowerCase() !== "z" || !(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey
+      || e.target.closest?.("input,select,textarea,[contenteditable]:not([contenteditable='false'])")
+      || !roi.editing || state.currentView !== "input") return;
+  e.preventDefault();
+  undoRoiPoint();
+}
+
 function handleSamKeyDown(e) {
   const key = e.key.toLowerCase();
   if (!["m", "b"].includes(key) || e.ctrlKey || e.altKey || e.metaKey
       || e.target.closest?.("input,select,textarea,[contenteditable='true']")
-      || !roi.editing || !samMode() || state.currentView !== "input") return;
+      || !roi.editing || !samMode() || roiEdit.splitting || roiEdit.busy || state.currentView !== "input") return;
   e.preventDefault();
   if (key === "b") {
     if (sam.multi) return;
@@ -1404,6 +1730,7 @@ function confirmSamRegion() {
 function handleSamContextMenu(e) {
   if (!roi.editing || state.currentView !== "input") return;
   e.preventDefault();
+  if (roiEdit.busy || roiEdit.splitting) return;
   if (linePrompt.held || linePrompt.stroke) return;
   if (!samMode()) { finalizeCurrentRegion(); return; }
   if (sam.multi) {
@@ -1414,7 +1741,7 @@ function handleSamContextMenu(e) {
 }
 
 function samExcluded() {
-  return roi.regions.map((r) => ({
+  return roi.regions.flatMap(regionParts).map((r) => ({
     hull: r.hull.map((p) => [p.x, p.y]),
     holes: (r.holes || []).map((h) => h.map((p) => [p.x, p.y])),
   }));
@@ -1437,6 +1764,7 @@ function clearSam() {
 }
 
 function updateSamControls() {
+  updateRoiEditControls();
   if (sam.result && sam.result.model_id && sam.result.model_id !== $("sam-model").value) {
     sam.result = null;
     sam.message = "模型已变化，请重新生成";
@@ -1455,15 +1783,27 @@ function updateSamControls() {
   }
   const on = samMode();
   $("sam-controls").classList.toggle("hidden", !on);
-  $("roi-edit-hint").textContent = on
+  $("roi-edit-hint").textContent = !roi.editing
+    ? "参数可提前设置。点击预览图下方「编辑感兴趣区域」后开始标注；Ctrl+Z 撤销。"
+    : on
     ? "点击后自动识别 · 右键确认 · 按住 m 添加正负点 · 按住 B＋左键划线提示模型修补 · 点击同类点删除"
-    : "左键标点自动构成凸包 · 点击已有点删除 · 右键完成当前区域 · 撤销可恢复已完成区域";
+    : "左键标点 · 点击已有点删除 · 右键完成区域 · Ctrl+Z 撤销上一点或删除最后一个区域";
   $("sam-hole-area").disabled = !$("sam-fill-holes").checked;
   $("sam-gap-width").disabled = !$("sam-ignore-boundaries").checked;
+  $("sam-notch-width").disabled = !$("sam-fill-notches").checked;
+  $("sam-notch-area").disabled = !$("sam-fill-notches").checked;
   $("viewer-stage").classList.toggle("line-mode", on && linePrompt.held);
-  $("btn-roi-undo").textContent = sam.scribbles.length ? "撤销上一条线提示" : "撤销上一点";
-  $("btn-sam-predict").disabled = sam.busy || sam.multi || linePrompt.held || !$("sam-model").value || !sam.prompts.some((p) => p.label === 1);
-  $("btn-sam-accept").disabled = sam.busy || sam.multi || sam.pending || linePrompt.held || !sam.result;
+  $("btn-roi-undo").textContent = "撤销";
+  if (roiEdit.busy) {
+    ["btn-roi-undo", "btn-roi-clear-current", "btn-roi-done", "btn-roi-clear-all", "btn-sam-predict", "btn-sam-accept"].forEach(id => { $(id).disabled = true; });
+    return;
+  }
+  $("btn-roi-undo").disabled = !roi.editing || !(roi.current.length || roi.regions.length || sam.prompts.length || sam.scribbles.length);
+  $("btn-roi-clear-current").disabled = !roi.editing || !(roi.current.length || sam.prompts.length || sam.scribbles.length);
+  $("btn-roi-done").disabled = !roi.editing;
+  $("btn-roi-clear-all").disabled = !(roi.current.length || roi.regions.length || sam.prompts.length || sam.scribbles.length);
+  $("btn-sam-predict").disabled = !roi.editing || sam.busy || sam.multi || linePrompt.held || !$("sam-model").value || !sam.prompts.some((p) => p.label === 1);
+  $("btn-sam-accept").disabled = !roi.editing || sam.busy || sam.multi || sam.pending || linePrompt.held || !sam.result;
   $("btn-sam-predict").textContent = sam.busy ? "正在识别…" : "重新识别";
   $("sam-status").textContent = linePrompt.held && !sam.busy ? "划线提示：在希望保留的位置画线，松开鼠标重新识别，松开 B 后右键确认"
     : sam.multi ? "正在添加多个提示点，松开 m 后自动识别"
@@ -1472,6 +1812,7 @@ function updateSamControls() {
 }
 
 function addSamPoint(x, y, negative = null) {
+  if (roiEdit.busy || roiEdit.splitting) return;
   if (linePrompt.stroke) return;
   if (x < 0 || y < 0 || x >= viewer.naturalW || y >= viewer.naturalH) return;
   const hit = sam.prompts.findIndex((p) => Math.hypot(p.x - x, p.y - y) <= 10 / viewer.scale);
@@ -1493,7 +1834,7 @@ function addSamPoint(x, y, negative = null) {
 }
 
 async function predictSamRegion() {
-  if (sam.busy || sam.multi || linePrompt.stroke || !roi.editing || !samMode() || state.currentView !== "input") return;
+  if (roiEdit.busy || roiEdit.splitting || sam.busy || sam.multi || linePrompt.stroke || !roi.editing || !samMode() || state.currentView !== "input") return;
   clearTimeout(sam.timer);
   sam.timer = null;
   sam.pending = false;
@@ -1518,6 +1859,15 @@ async function predictSamRegion() {
     return;
   }
   if (!postprocess.ignore_small_boundaries && !validWidth) postprocess.max_gap_width_m = 0.2;
+  const validNotchWidth = Number.isFinite(postprocess.max_notch_width_m) && postprocess.max_notch_width_m > 0 && postprocess.max_notch_width_m <= 5;
+  const validNotchArea = Number.isFinite(postprocess.max_notch_area_m2) && postprocess.max_notch_area_m2 > 0;
+  if (postprocess.fill_small_notches && (!validNotchWidth || !validNotchArea)) {
+    sam.message = "凹槽槽口宽度须大于 0 且不超过 5 米，最大面积须大于 0 平方米";
+    drawRoi();
+    return;
+  }
+  if (!validNotchWidth) postprocess.max_notch_width_m = 0.5;
+  if (!validNotchArea) postprocess.max_notch_area_m2 = 10;
   const optionsKey = JSON.stringify(samPostprocess());
   const points = sam.prompts.map((p) => ({ ...p }));
   sam.requestVersion = version;
@@ -1560,7 +1910,7 @@ function acceptSamRegion() {
 }
 
 function pointInRegion(point, region) {
-  return pointInPolygon(point, region.hull) && !(region.holes || []).some((h) => pointInPolygon(point, h));
+  return regionParts(region).some(part => pointInPolygon(point, part.hull) && !(part.holes || []).some(h => pointInPolygon(point, h)));
 }
 
 /* 读取当前控件中的分级与施肥设置（全局快照与分组值共用同一形态） */
@@ -1665,6 +2015,9 @@ async function refreshRoiArea() {
 
 /* 区域删除后重排分组里的区域编号（removedIdx 为被删除的区域下标） */
 function remapGroupsAfterRegionDelete(removedIdx) {
+  roiEdit.selected = new Set(Array.from(roiEdit.selected).filter(i=>i!==removedIdx).map(i=>i>removedIdx?i-1:i));
+  roiEdit.guide = [];
+  if (roiEdit.selected.size !== 1) roiEdit.splitting = false;
   let changed = false;
   roi.groups.forEach((g) => {
     const next = g.regions
@@ -1683,6 +2036,9 @@ function remapGroupsAfterRegionDelete(removedIdx) {
 }
 
 function resetRoi() {
+  roiEdit.version++;
+  roiEdit.busy = false;
+  clearRoiEditSelection();
   clearSam();
   roi.editing = false;
   roi.regions = [];
@@ -1695,7 +2051,6 @@ function resetRoi() {
   roi.groupPick = new Set();
   updateSettingsBinding();
   $("viewer-stage").classList.remove("editing");
-  $("roi-toolbar").classList.add("hidden");
   $("roi-panel").classList.add("hidden");
   $("roi-canvas").classList.add("hidden");
   $("btn-roi-edit").textContent = "✏️ 编辑感兴趣区域";
@@ -1709,30 +2064,51 @@ function resetRoi() {
 function previewLonLat(x, y) {
   const g = state.session && state.session.georef;
   if (!g) return null;
+  if (g.crs && g.crs !== "EPSG:4326") return null;
   const sx = (x + 0.5) * g.source_width / g.preview_width;
   const sy = (y + 0.5) * g.source_height / g.preview_height;
   const t = g.transform;
   return { lon: t[0] * sx + t[1] * sy + t[2], lat: t[3] * sx + t[4] * sy + t[5] };
 }
 
-function convexHull(points) {
-  if (points.length < 3) return points.slice();
-  const p = points.slice().sort((a, b) => a.x - b.x || a.y - b.y);
+function manualBoundary(points) {
+  /* 按点击顺序插入最近的可连接边，内部点也成为边界顶点；原始顺序留给撤销。 */
   const cross = (o, a, b) => (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
-  const lower = [];
-  for (const pt of p) {
-    while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], pt) <= 0) lower.pop();
-    lower.push(pt);
+  const onSegment = (p, a, b) => Math.abs(cross(a, b, p)) < 1e-8 &&
+    p.x >= Math.min(a.x, b.x) && p.x <= Math.max(a.x, b.x) &&
+    p.y >= Math.min(a.y, b.y) && p.y <= Math.max(a.y, b.y);
+  const intersects = (a, b, c, d) =>
+    (cross(a, b, c) * cross(a, b, d) < 0 && cross(c, d, a) * cross(c, d, b) < 0) ||
+    onSegment(c, a, b) || onSegment(d, a, b) || onSegment(a, c, d) || onSegment(b, c, d);
+  const simple = (poly) => {
+    for (let i = 0; i < poly.length; i++) {
+      for (let j = i + 1; j < poly.length; j++) {
+        if (j === i + 1 || (i === 0 && j === poly.length - 1)) continue;
+        if (intersects(poly[i], poly[(i + 1) % poly.length], poly[j], poly[(j + 1) % poly.length])) return false;
+      }
+    }
+    return true;
+  };
+  const boundary = points.slice(0, 3);
+  for (const pt of points.slice(3)) {
+    let bestIndex = -1, bestDistance = Infinity;
+    for (let i = 0; i < boundary.length; i++) {
+      const a = boundary[i], b = boundary[(i + 1) % boundary.length];
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const lengthSquared = dx * dx + dy * dy;
+      const t = lengthSquared ? Math.max(0, Math.min(1, ((pt.x - a.x) * dx + (pt.y - a.y) * dy) / lengthSquared)) : 0;
+      const distance = Math.hypot(pt.x - a.x - t * dx, pt.y - a.y - t * dy);
+      if (distance >= bestDistance) continue;
+      const candidate = boundary.slice();
+      candidate.splice(i + 1, 0, pt);
+      if (!simple(candidate)) continue;
+      bestIndex = i + 1;
+      bestDistance = distance;
+    }
+    if (bestIndex < 0) return null;
+    boundary.splice(bestIndex, 0, pt);
   }
-  const upper = [];
-  for (let i = p.length - 1; i >= 0; i--) {
-    const pt = p[i];
-    while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], pt) <= 0) upper.pop();
-    upper.push(pt);
-  }
-  lower.pop();
-  upper.pop();
-  return lower.concat(upper);
+  return boundary;
 }
 
 function pointInPolygon(pt, poly) {
@@ -1748,7 +2124,8 @@ function pointInPolygon(pt, poly) {
 }
 
 function addRoiPoint(x, y) {
-  /* 点击已有标点附近视为删除该标点：凸包按剩余标点重算，从而可以内缩 */
+  if (roiEdit.busy || roiEdit.splitting) return;
+  /* 点击已有标点附近视为删除该标点，按剩余标点重建边界。 */
   const hitR = 10 / viewer.scale;
   let hitIdx = -1, hitD = Infinity;
   for (let i = 0; i < roi.current.length; i++) {
@@ -1756,8 +2133,10 @@ function addRoiPoint(x, y) {
     if (d <= hitR && d < hitD) { hitD = d; hitIdx = i; }
   }
   if (hitIdx >= 0) {
-    roi.current.splice(hitIdx, 1);
-    toast(`已删除标点 ${hitIdx + 1}（凸包按剩余标点重算）`);
+    const remaining = roi.current.filter((_, i) => i !== hitIdx);
+    if (!manualBoundary(remaining)) { toast("删除后边界会相交，请先撤销后续标点", true); return; }
+    roi.current = remaining;
+    toast(`已删除标点 ${hitIdx + 1}（边界按剩余标点重算）`);
     drawRoi();
     updateRoiPanel();
     return;
@@ -1769,11 +2148,16 @@ function addRoiPoint(x, y) {
     }
   }
   const ll = previewLonLat(x, y);
-  roi.current.push({
+  const point = {
     x, y,
     lon: ll ? +ll.lon.toFixed(8) : null,
     lat: ll ? +ll.lat.toFixed(8) : null,
-  });
+  };
+  if (!manualBoundary([...roi.current, point])) {
+    toast("该标点无法连接成不相交的边界，请换个位置", true);
+    return;
+  }
+  roi.current.push(point);
   drawRoi();
   updateRoiPanel();
 }
@@ -1781,19 +2165,27 @@ function addRoiPoint(x, y) {
 function finalizeCurrentRegion() {
   if (!roi.current.length) return;
   if (roi.current.length < 3) {
-    toast("当前区域至少需要 3 个标点才能构成凸包", true);
+    toast("当前区域至少需要 3 个标点才能构成闭合区域", true);
     return;
   }
-  const hull = convexHull(roi.current);
-  roi.regions.push({ points: roi.current, hull });
+  const hull = manualBoundary(roi.current);
+  if (!hull) { toast("区域边界相交，请调整标点", true); return; }
+  const area = hull.reduce((sum, p, i) => {
+    const next = hull[(i + 1) % hull.length];
+    return sum + p.x * next.y - next.x * p.y;
+  }, 0);
+  if (Math.abs(area) < 1e-8) { toast("标点不能全部位于同一直线上", true); return; }
+  roi.regions.push({ source: "manual", points: roi.current, hull });
   roi.current = [];
   drawRoi();
   updateRoiPanel();
   refreshRoiArea();
-  toast(`区域 ${roi.regions.length} 已完成（凸包 ${hull.length} 个顶点），可继续标下一个区域`);
+  toast(`区域 ${roi.regions.length} 已完成（边界 ${hull.length} 个顶点），可继续标下一个区域`);
 }
 
 function undoRoiPoint() {
+  if (roiEdit.busy) return;
+  if (roiEdit.splitting && roiEdit.guide.length) { roiEdit.guide.pop(); drawRoi(); return; }
   if (samMode() && linePrompt.stroke) { toast("请先完成当前划线再撤销"); return; }
   if (samMode() && sam.scribbles.length) {
     sam.scribbles.pop();
@@ -1819,31 +2211,12 @@ function undoRoiPoint() {
   if (roi.current.length) {
     roi.current.pop();
   } else if (roi.regions.length) {
-    const last = roi.regions.pop();
+    roi.regions.pop();
+    // 已完成区域的提示已结束使命，撤销只删除区域，不恢复或重新识别。
+    clearSam();
     remapGroupsAfterRegionDelete(roi.regions.length);
-    /* 撤回已完成区域时恢复其标点为进行中区域，可继续增删标点后重新完成 */
-    if (last.source === "sam") {
-      $("roi-method").value = "sam";
-      if (last.model_id) $("sam-model").value = last.model_id;
-      clearSam();
-      sam.prompts = last.points.map((p) => ({ ...p }));
-      sam.scribbles = (last.scribbles || []).slice();
-      if (last.postprocess) {
-        $("sam-fill-holes").checked = last.postprocess.fill_holes;
-        $("sam-hole-area").value = last.postprocess.max_hole_area_m2;
-        $("sam-smooth-boundary").checked = last.postprocess.smooth_boundary;
-        $("sam-ignore-boundaries").checked = last.postprocess.ignore_small_boundaries || false;
-        $("sam-gap-width").value = last.postprocess.max_gap_width_m ?? 0.2;
-      }
-      sam.message = "已恢复提示点，将自动识别";
-      scheduleSamPrediction();
-    } else {
-      $("roi-method").value = "manual";
-      roi.current = last.points.slice();
-      clearSam();
-    }
     refreshRoiArea();
-    toast(`已撤回区域 ${roi.regions.length + 1}，其标点已恢复为当前编辑区域`);
+    toast(`已撤销区域 ${roi.regions.length + 1}`);
   } else {
     return;
   }
@@ -1857,13 +2230,26 @@ function centroidOf(pts) {
   return { x: x / pts.length, y: y / pts.length };
 }
 
-function drawRoi() {
-  updateSamControls();
+function drawRoi(animation = false) {
+  if (!animation) updateSamControls();
   const canvas = $("roi-canvas");
-  if (canvas.classList.contains("hidden") || !canvas.width) return;
+  if (canvas.classList.contains("hidden")) return;
+  const stage = $("viewer-stage");
+  const width = stage.clientWidth || canvas.clientWidth || canvas.width;
+  const height = stage.clientHeight || canvas.clientHeight || canvas.height;
+  if (!width || !height) return;
+  const dpr = window.devicePixelRatio || 1;
+  const pixelWidth = Math.round(width * dpr), pixelHeight = Math.round(height * dpr);
+  if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+    canvas.width = pixelWidth;
+    canvas.height = pixelHeight;
+  }
   const ctx = canvas.getContext("2d");
   const s = viewer.scale;
+  // 在视口的真实像素画布上重绘，避免文字随影像位图一起放大而模糊。
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.setTransform(dpr * s, 0, 0, dpr * s, dpr * viewer.tx, dpr * viewer.ty);
 
   const drawDots = (pts, fill, stroke) => {
     for (const p of pts) {
@@ -1884,20 +2270,45 @@ function drawRoi() {
   };
 
   roi.regions.forEach((region, idx) => {
-    tracePoly(region.hull);
-    (region.holes || []).forEach((h) => tracePoly(h, true));
-    ctx.fillStyle = "rgba(255, 152, 0, 0.16)";
+    const selected = roiEdit.selected.has(idx);
+    const parts = regionParts(region);
+    parts.forEach((part, index) => {
+      tracePoly(part.hull, index > 0);
+      (part.holes || []).forEach(h => tracePoly(h, true));
+    });
+    ctx.fillStyle = selected ? "rgba(211, 47, 47, 0.22)" : "rgba(255, 152, 0, 0.16)";
     ctx.fill("evenodd");
-    ctx.lineWidth = 2.5 / s;
-    ctx.strokeStyle = "#ef6c00";
+    ctx.lineWidth = (selected ? 3 : 2.5) / s;
+    ctx.strokeStyle = selected ? "#d32f2f" : "#ef6c00";
+    ctx.setLineDash(selected ? [9 / s, 6 / s] : []);
+    ctx.lineDashOffset = selected ? -(Date.now() / 65 % 15) / s : 0;
     ctx.stroke();
-    if (region.source !== "sam") drawDots(region.hull, "#fff3e0", "#e65100");
-    const c = centroidOf(region.hull);
-    ctx.font = `${15 / s}px sans-serif`;
-    ctx.fillStyle = "#e65100";
-    ctx.textAlign = "center";
-    ctx.fillText(`区域${idx + 1}`, c.x, c.y);
+    ctx.setLineDash([]);
+    ctx.lineDashOffset = 0;
+    if (region.source === "manual" || !region.source) parts.forEach(part => drawDots(part.hull, "#fff3e0", selected ? "#d32f2f" : "#e65100"));
+    parts.forEach(part => {
+      const c = centroidOf(part.hull);
+      ctx.font = `600 ${15 / s}px "Microsoft YaHei", sans-serif`;
+      ctx.fillStyle = selected ? "#b71c1c" : "#e65100";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.strokeStyle = "rgba(255, 255, 255, 0.85)";
+      ctx.lineWidth = 2 / s;
+      ctx.strokeText(`区域${idx + 1}`, c.x, c.y);
+      ctx.fillText(`区域${idx + 1}`, c.x, c.y);
+    });
   });
+  if (roiEdit.splitting && roiEdit.guide.length) {
+    ctx.beginPath();
+    ctx.moveTo(roiEdit.guide[0].x, roiEdit.guide[0].y);
+    roiEdit.guide.slice(1).forEach(p => ctx.lineTo(p.x, p.y));
+    ctx.strokeStyle = "#00838f";
+    ctx.lineWidth = 2.5 / s;
+    ctx.setLineDash([6 / s, 4 / s]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    drawDots(roiEdit.guide, "#e0f7fa", "#00838f");
+  }
 
   if (roi.editing && samMode()) {
     if (sam.result) sam.result.regions.forEach((r) => {
@@ -1926,7 +2337,7 @@ function drawRoi() {
 
   if (roi.current.length) {
     if (roi.current.length >= 3) {
-      const hull = convexHull(roi.current);
+      const hull = manualBoundary(roi.current);
       tracePoly(hull);
       ctx.fillStyle = "rgba(21, 101, 192, 0.10)";
       ctx.fill();
@@ -1945,9 +2356,12 @@ function drawRoi() {
     }
     drawDots(roi.current, "#e3f2fd", "#1565c0");
   }
+  queueRoiSelectionFrame();
 }
 
 function setRoiEditing(on) {
+  if (roiEdit.busy) { toast("区域操作尚未完成，请稍候", true); return; }
+  if (on && state.session && state.session.has_input_preview && state.currentView !== "input") showPreview("input");
   if (!on && roi.editing && roi.current.length) {
     const discard = window.confirm("当前区域未完成，是否删除当前编辑区域并退出编辑？");
     if (!discard) return;  // 用户取消，保持编辑状态
@@ -1969,18 +2383,68 @@ function setRoiEditing(on) {
     return;
   }
   roi.editing = on;
-  if (!on) clearSam();
+  if (on) {
+    const section = $("card-regions");
+    for (const card of document.querySelectorAll(".workflow > .card")) {
+      if (card === section) break;
+      card.open = false;
+    }
+    section.open = true;
+    section.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+  if (!on) { clearSam(); clearRoiEditSelection(); }
   $("viewer-stage").classList.toggle("editing", on);
-  $("roi-toolbar").classList.toggle("hidden", !on);
   $("btn-roi-edit").textContent = on ? "✏️ 编辑中..." : "✏️ 编辑感兴趣区域";
   $("btn-roi-edit").classList.toggle("primary", on);
   drawRoi();
+}
+
+function clearAllRoi() {
+  if (roiEdit.busy) return;
+  if (!window.confirm("确定清空全部感兴趣区域、当前标点和分组吗？此操作无法撤销。")) return;
+  clearSam();
+  clearRoiEditSelection();
+  roi.regions = [];
+  roi.current = [];
+  roi.groups = [];
+  roi.groupPick.clear();
+  roi.groupEditing = false;
+  roi.selectedGroup = null;
+  if (roi.globalSnapshot) applySettingsToControls(roi.globalSnapshot);
+  roi.globalSnapshot = null;
+  drawRoi();
+  updateRoiPanel();
+  refreshRoiArea();
+  toast("已清空全部感兴趣区域");
+}
+
+async function exportRoiShp() {
+  if (roiEdit.busy) { toast("请等待区域操作完成后导出", true); return; }
+  if (roi.exporting) return;
+  if (!roi.regions.length) { toast("请先右键完成至少一个感兴趣区域", true); return; }
+  const button = $("btn-roi-export");
+  const regions = roi.regions.map(serializeRoiRegion);
+  roi.exporting = true;
+  button.disabled = true;
+  button.textContent = "请选择保存位置…";
+  try {
+    const result = await api("/api/roi/export-shp", { regions });
+    if (result.cancelled) return;
+    toast(`已将 ${regions.length} 个区域保存到：${result.directory}${roi.current.length ? "；当前编辑区域需右键完成后另行导出" : ""}`);
+  } catch (error) {
+    toast(error.message || "区域导出失败", true);
+  } finally {
+    roi.exporting = false;
+    button.textContent = "⬇ 导出 SHP";
+    button.disabled = roi.regions.length === 0;
+  }
 }
 
 function updateRoiControls() {
   const ready = state.session && state.session.has_input_preview && state.session.georef;
   $("btn-roi-edit").disabled = !ready;
   const count = roi.regions.length;
+  $("btn-roi-export").disabled = count === 0 || roi.exporting;
   $("make-mode-roi-count").textContent = count;
   const roiRadio = document.querySelector('input[name="make-mode"][value="roi"]');
   roiRadio.disabled = count === 0;
@@ -1989,7 +2453,7 @@ function updateRoiControls() {
   }
   /* 「编辑分组」按钮仅在勾选「感兴趣区域制作」且已有区域时显示 */
   const roiChecked = document.querySelector('input[name="make-mode"]:checked').value === "roi";
-  $("btn-roi-groups").classList.toggle("hidden", !(roiChecked && count > 0));
+  $("btn-roi-groups").classList.toggle("hidden", annotationMode() || !(roiChecked && count > 0));
   $("btn-roi-groups").disabled = count === 0;
   const btnGroups = $("btn-roi-groups");
   btnGroups.textContent = roi.groupEditing ? "✔ 完成分组" : "👥 编辑分组";
@@ -2024,7 +2488,7 @@ function updateRoiPanel() {
 
   roi.regions.forEach((region, idx) => {
     const div = document.createElement("div");
-    div.className = "roi-region";
+    div.className = "roi-region" + (roiEdit.selected.has(idx) ? " is-picked" : "");
     const inGroup = groupedRegions.has(idx);
     const picked = roi.groupPick.has(idx) && !inGroup;
     const cb = roi.groupEditing
@@ -2036,9 +2500,10 @@ function updateRoiPanel() {
     div.innerHTML = `
       ${cb}
       <span class="rr-title">区域${idx + 1}${region.model_label ? `<br>${escapeHtml(region.model_label)}` : ""}</span>
-      <span class="rr-pts">${region.source === "sam" ? "自动轮廓" : "凸包"}顶点 ${region.hull.length} / ${region.source === "sam" ? "提示点" : "标点"} ${region.points.length}${region.holes && region.holes.length ? ` / 空洞 ${region.holes.length}` : ""}：<br>${ptsText}</span>
+      <span class="rr-pts">${region.source === "sam" ? "自动轮廓" : region.source === "edited" ? "编辑边界" : "手工边界"}顶点 ${regionParts(region).reduce((n,p)=>n+p.hull.length,0)} / ${region.source === "edited" ? `独立部分 ${regionParts(region).length}` : `${region.source === "sam" ? "提示点" : "标点"} ${region.points.length}`}${region.holes && region.holes.length ? ` / 空洞 ${region.holes.length}` : ""}：<br>${ptsText}</span>
       <button class="rr-del" title="删除该区域">×</button>`;
     div.querySelector(".rr-del").addEventListener("click", () => {
+      if (roiEdit.busy) return;
       roi.regions.splice(idx, 1);
       roi.groupPick.delete(idx);
       remapGroupsAfterRegionDelete(idx);
@@ -2176,7 +2641,7 @@ function initViewer() {
     const mx = e.clientX - rect.left;
     const my = e.clientY - rect.top;
     const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
-    const newScale = Math.min(Math.max(viewer.scale * factor, 0.02), 60);
+    const newScale = Math.min(Math.max(viewer.scale * factor, 0.02), viewerMaxScale());
     viewer.tx = mx - (mx - viewer.tx) * (newScale / viewer.scale);
     viewer.ty = my - (my - viewer.ty) * (newScale / viewer.scale);
     viewer.scale = newScale;
@@ -2186,8 +2651,9 @@ function initViewer() {
   let dragging = false, lastX = 0, lastY = 0, downX = 0, downY = 0, movedFar = false;
   stage.addEventListener("pointerdown", (e) => {
     if (!viewer.naturalW || e.button !== 0) return;
+    if (roi.editing) stage.focus?.({ preventScroll: true });
     linePrompt.ignorePointerUp = false;
-    if (roi.editing && samMode() && linePrompt.held && state.currentView === "input") {
+    if (roi.editing && !e.ctrlKey && !roiEdit.splitting && !roiEdit.busy && samMode() && linePrompt.held && state.currentView === "input") {
       dragging = false;
       beginSamLine(e);
       linePrompt.ignorePointerUp = true;
@@ -2200,7 +2666,7 @@ function initViewer() {
     try { stage.setPointerCapture(e.pointerId); } catch (err) { /* 合成事件无活动指针 */ }
   });
   stage.addEventListener("pointermove", (e) => {
-    if (roi.editing && samMode() && (linePrompt.held || linePrompt.stroke)) { moveSamLine(e); return; }
+    if (roi.editing && !e.ctrlKey && !roiEdit.splitting && !roiEdit.busy && samMode() && (linePrompt.held || linePrompt.stroke)) { moveSamLine(e); return; }
     if (!dragging) return;
     if (Math.abs(e.clientX - downX) + Math.abs(e.clientY - downY) > 4) movedFar = true;
     viewer.tx += e.clientX - lastX;
@@ -2221,6 +2687,16 @@ function initViewer() {
       const mx = e.clientX - rect.left;
       const my = e.clientY - rect.top;
       const x = (mx - viewer.tx) / viewer.scale, y = (my - viewer.ty) / viewer.scale;
+      if (roiEdit.busy) return;
+      if (e.ctrlKey) { toggleRoiSelection({x,y}); return; }
+      if (roiEdit.splitting) {
+        if (roiEdit.selected.size !== 1) { toast("分割时请仅选择一个区域", true); return; }
+        if (x >= 0 && y >= 0 && x < viewer.naturalW && y < viewer.naturalH) {
+          if (roiEdit.guide.length >= 256) { toast("折线最多支持 256 个点", true); return; }
+          roiEdit.guide.push({x,y}); drawRoi();
+        }
+        return;
+      }
       if (samMode()) addSamPoint(x, y, sam.multi ? false : e.shiftKey ? true : null);
       else if (x >= 0 && y >= 0 && x < viewer.naturalW && y < viewer.naturalH) addRoiPoint(x, y);
     }
@@ -2238,10 +2714,13 @@ function initViewer() {
   });
   stage.addEventListener("contextmenu", handleSamContextMenu);
   document.addEventListener("keydown", handleSamKeyDown);
+  document.addEventListener("keydown", handleRoiUndoKeyDown);
+  document.addEventListener("keydown", handleRoiEditKeyDown);
   document.addEventListener("keyup", handleSamKeyUp);
   window.addEventListener("blur", () => { releaseSamMulti(); releaseSamLine(); });
 
   $("btn-roi-edit").addEventListener("click", () => setRoiEditing(!roi.editing));
+  $("btn-roi-export").addEventListener("click", exportRoiShp);
   $("roi-method").addEventListener("change", () => {
     if (roi.current.length) {
       $("roi-method").value = "manual";
@@ -2258,6 +2737,9 @@ function initViewer() {
   $("sam-smooth-boundary").addEventListener("change", changeSamPostprocess);
   $("sam-ignore-boundaries").addEventListener("change", changeSamPostprocess);
   $("sam-gap-width").addEventListener("input", changeSamPostprocess);
+  $("sam-fill-notches").addEventListener("change", changeSamPostprocess);
+  $("sam-notch-width").addEventListener("input", changeSamPostprocess);
+  $("sam-notch-area").addEventListener("input", changeSamPostprocess);
   $("btn-sam-accept").addEventListener("click", confirmSamRegion);
   $("btn-roi-done").addEventListener("click", () => setRoiEditing(false));
   $("btn-roi-undo").addEventListener("click", undoRoiPoint);
@@ -2268,16 +2750,12 @@ function initViewer() {
     drawRoi();
     updateRoiPanel();
   });
-  $("btn-roi-clear-all").addEventListener("click", () => {
-    clearSam();
-    roi.regions = [];
-    roi.current = [];
-    roi.groups = [];
-    drawRoi();
-    updateRoiPanel();
-    refreshRoiArea();
-    toast("已清空全部感兴趣区域");
-  });
+  $("btn-roi-clear-all").addEventListener("click", clearAllRoi);
+  $("btn-roi-merge").addEventListener("click", () => runRoiEdit("merge"));
+  $("btn-roi-split").addEventListener("click", beginRoiSplit);
+  $("btn-roi-split-run").addEventListener("click", () => runRoiEdit("split"));
+  $("btn-roi-split-reset").addEventListener("click", () => { if (!roiEdit.busy) { roiEdit.guide = []; drawRoi(); } });
+  $("btn-roi-split-cancel").addEventListener("click", () => { if (!roiEdit.busy) { roiEdit.splitting = false; roiEdit.guide = []; drawRoi(); } });
 
   /* 区域分组：在感兴趣区域列表中勾选区域 → 添加为分组 → 完成 */
   document.querySelectorAll('input[name="make-mode"]').forEach((radio) => {
@@ -2299,7 +2777,7 @@ function initViewer() {
   $("btn-group-add").addEventListener("click", addGroupFromRegions);
   $("btn-group-finish").addEventListener("click", finishGroupEditing);
 
-  $("btn-zoom-in").addEventListener("click", () => { viewer.scale = Math.min(viewer.scale * 1.25, 60); applyViewerTransform(); });
+  $("btn-zoom-in").addEventListener("click", () => { viewer.scale = Math.min(viewer.scale * 1.25, viewerMaxScale()); applyViewerTransform(); });
   $("btn-zoom-out").addEventListener("click", () => { viewer.scale = Math.max(viewer.scale / 1.25, 0.02); applyViewerTransform(); });
   $("btn-fit").addEventListener("click", fitViewer);
   window.addEventListener("resize", () => {
@@ -2354,6 +2832,14 @@ async function init() {
   initViewer();
   initDj2pr();
   await refreshSession();
+  state.validated = !!(state.session.validation && !state.session.validation.errors.length);
+  applySystemMode();
+  if (state.session.has_input_preview) {
+    if (state.session.validation) renderValidation(state.session.validation);
+    showPreview("input");
+    $("card-input").open = false;
+    $("card-validation").open = false;
+  }
 }
 
 init();

@@ -18,6 +18,16 @@ from rasterio.windows import Window
 
 
 class GeometryTests(unittest.TestCase):
+    def test_manual_concave_boundary_survives_conversion_and_rasterization(self):
+        outline = [[0, 0], [5, 4], [10, 0], [10, 10], [0, 10]]
+        poly = polygons_lonlat_to_pixel(
+            [{"source": "manual", "hull": outline}], Affine.identity())[0]
+        np.testing.assert_array_equal(poly, outline)
+        mask = rasterize_polygons_in_window([poly], Window(0, 0, 10, 10))
+        self.assertFalse(mask[1, 5])
+        self.assertTrue(mask[6, 5])
+        self.assertLess(mask.sum(), 100)
+
     def test_prompt_validation(self):
         for points in ([], [{"x": 1, "y": 1, "label": 0}],
                        [{"x": float("nan"), "y": 1, "label": 1}],

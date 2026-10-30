@@ -81,10 +81,16 @@ async function run() {
     assert.equal(roi.regions[0].source, "sam");
     assert.equal(serializeRoiRegion(roi.regions[0]).point_labels[0], 1);
     assert.equal(sam.prompts.length, 0);
+    const beforeUndoRequests = requests.length;
     undoRoiPoint();
     assert.equal(roi.regions.length, 0);
-    assert.equal(sam.prompts[0].label, 1);
+    assert.equal(sam.prompts.length, 0);
+    assert.equal(sam.scribbles.length, 0);
+    assert.equal(sam.result, null);
+    assert.equal(sam.timer, null);
+    assert.equal(requests.length, beforeUndoRequests);
     assert.equal(roi.current.length, 0);
+    addSamPoint(3, 3, false);
   `, context);
 
   request = vm.runInContext("predictSamRegion()", context);
@@ -115,7 +121,9 @@ async function run() {
     assert.equal(serializeRoiRegion(roi.regions[0]).model_id, "hq_sam_vit_l");
     $("sam-model").value = "sam3";
     undoRoiPoint();
-    assert.equal($("sam-model").value, "hq_sam_vit_l");
+    assert.equal($("sam-model").value, "sam3");
+    assert.equal(sam.prompts.length, 0);
+    assert.equal(sam.timer, null);
   `, context);
 
   vm.runInContext(`
@@ -186,6 +194,9 @@ async function run() {
     $("sam-smooth-boundary").checked = true;
     $("sam-ignore-boundaries").checked = true;
     $("sam-gap-width").value = "0.3";
+    $("sam-fill-notches").checked = true;
+    $("sam-notch-width").value = "0.6";
+    $("sam-notch-area").value = "8.5";
     changeSamPostprocess();
     resolvePrediction(result());
   `, context);
@@ -198,6 +209,9 @@ async function run() {
     assert.equal(requests.at(-1).postprocess.smooth_boundary, true);
     assert.equal(requests.at(-1).postprocess.ignore_small_boundaries, true);
     assert.equal(requests.at(-1).postprocess.max_gap_width_m, 0.3);
+    assert.equal(requests.at(-1).postprocess.fill_small_notches, true);
+    assert.equal(requests.at(-1).postprocess.max_notch_width_m, 0.6);
+    assert.equal(requests.at(-1).postprocess.max_notch_area_m2, 8.5);
     resolvePrediction({...result(), postprocess:requests.at(-1).postprocess});
   `, context);
   await Promise.resolve();
@@ -206,10 +220,17 @@ async function run() {
     assert.equal(serializeRoiRegion(roi.regions[0]).postprocess.max_hole_area_m2, 12.5);
     $("sam-fill-holes").checked = false;
     $("sam-ignore-boundaries").checked = false;
+    $("sam-fill-notches").checked = false;
+    $("sam-notch-width").value = "1.5";
     undoRoiPoint();
-    assert.equal($("sam-fill-holes").checked, true);
-    assert.equal($("sam-ignore-boundaries").checked, true);
+    assert.equal($("sam-fill-holes").checked, false);
+    assert.equal($("sam-ignore-boundaries").checked, false);
     assert.equal(Number($("sam-gap-width").value), 0.3);
+    assert.equal($("sam-fill-notches").checked, false);
+    assert.equal(Number($("sam-notch-width").value), 1.5);
+    assert.equal(Number($("sam-notch-area").value), 8.5);
+    assert.equal(sam.prompts.length, 0);
+    assert.equal(sam.timer, null);
     clearSam();
     handleSamKeyDown({key:"m",target:{},preventDefault(){}});
     addSamPoint(3,3,false);
@@ -282,7 +303,10 @@ async function run() {
     assert.equal(roi.regions[0].scribbles.length, 1);
     assert.equal(serializeRoiRegion(roi.regions[0]).scribble_count, 1);
     undoRoiPoint();
-    assert.equal(sam.scribbles.length, 1);
+    assert.equal(sam.scribbles.length, 0);
+    assert.equal(sam.prompts.length, 0);
+    assert.equal(sam.timer, null);
+    addSamPoint(3,3,false);
     flushTimer(sam.timer); resolvePrediction(result());
   `, context);
   await Promise.resolve();
@@ -315,12 +339,18 @@ async function run() {
     assert.equal(roi.regions.length, 1);
     assert.equal(roi.regions[0].scribbles.length, 1);
     undoRoiPoint();
-    assert.equal(sam.scribbles.length, 1);
-    const restoredPrompts = sam.prompts.length;
+    assert.equal(roi.regions.length, 0);
+    assert.equal(sam.scribbles.length, 0);
+    assert.equal(sam.prompts.length, 0);
+    assert.equal(sam.timer, null);
+    // 新建的未确认线提示仍可独立撤销，不能借此恢复已删除区域的提示。
+    addSamPoint(3,3,false);
+    sam.scribbles = [{points:[[3,3],[7,7]]}];
+    const activePrompts = sam.prompts.length;
     // 撤销线提示优先于撤销离散点，并由模型重新识别。
     undoRoiPoint();
     assert.equal(sam.scribbles.length, 0);
-    assert.equal(sam.prompts.length, restoredPrompts);
+    assert.equal(sam.prompts.length, activePrompts);
     flushTimer(sam.timer);
     assert.equal(requests.at(-1).scribbles.length, 0);
     resolvePrediction(result());

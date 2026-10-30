@@ -11,8 +11,8 @@
     <div class="topbar-title">
       <span class="logo">🌾</span>
       <div>
-        <h1>水稻施肥处方图生成系统</h1>
-        <p class="subtitle">无人机多光谱影像 · 营养诊断 · 大疆兼容处方图</p>
+        <div class="title-row"><h1 id="system-title">水稻施肥处方图生成系统</h1><button class="btn ghost" id="btn-system-mode" type="button" aria-pressed="false">切换到数据标注模式</button></div>
+        <p class="subtitle" id="system-subtitle">无人机多光谱影像 · 营养诊断 · 大疆兼容处方图</p>
       </div>
     </div>
     <div class="topbar-actions">
@@ -24,12 +24,11 @@
   <main class="layout">
     <section class="workflow">
 
-      <!-- ① 数据接入 -->
-      <div class="card" id="card-input">
-        <div class="card-head">
+      <details open class="card" id="card-input">
+        <summary class="card-head">
           <span class="step-no">1</span>
           <h2>数据接入</h2>
-        </div>
+        </summary>
         <div class="tabs" id="input-tabs">
           <button class="tab active" data-tab="upload" type="button">本地上传</button>
           <button class="tab" data-tab="folder" type="button">文件夹路径</button>
@@ -58,7 +57,7 @@
           <p class="hint">扫描后直接引用本地文件（不拷贝），适合 1GB 以上的大影像。</p>
         </div>
 
-        <div class="recognition-hint">
+        <div class="recognition-hint" id="recognition-hint">
           <b>文件名自动识别：</b>含 <code>RedEdge</code> → B1 红边 ｜ 含 <code>Green</code> → B2 绿光 ｜
           含 <code>Red</code> → B3 红光 ｜ 含 <code>NIR</code> → B4 近红外 ｜
           不含关键字的 <code>result</code> 图 → 整体预览图（仅展示，不参与诊断）
@@ -66,26 +65,24 @@
 
         <div class="file-table" id="file-table"></div>
 
-        <div class="actions">
-          <button class="btn primary" type="button" id="btn-validate">校验数据并生成预览</button>
+        <div class="actions hidden" id="validation-actions">
+          <button class="btn primary" type="button" id="btn-validate">重新校验并生成预览</button>
         </div>
-      </div>
+      </details>
 
-      <!-- ② 校验结果 -->
-      <div class="card hidden" id="card-validation">
-        <div class="card-head">
+      <details open class="card hidden" id="card-validation">
+        <summary class="card-head">
           <span class="step-no">2</span>
           <h2>校验结果</h2>
-        </div>
+        </summary>
         <div id="validation-body"></div>
-      </div>
+      </details>
 
-      <!-- ③ 参数设置 -->
-      <div class="card hidden" id="card-params">
-        <div class="card-head">
+      <details open class="card hidden" id="card-params">
+        <summary class="card-head">
           <span class="step-no">3</span>
           <h2>参数设置</h2>
-        </div>
+        </summary>
 
         <h3 class="param-title">生育期与诊断模型</h3>
         <div class="stage-grid" id="stage-grid"></div>
@@ -127,7 +124,7 @@
           <label><input type="radio" name="make-mode" value="full" checked> 全图制作</label>
           <label><input type="radio" name="make-mode" value="roi"> 感兴趣区域制作（<span id="make-mode-roi-count">0</span> 个区域）</label>
         </div>
-        <p class="hint" id="make-mode-hint">在右侧预览图点击「✏️ 编辑感兴趣区域」进行标点，左键标点、右键完成当前区域。</p>
+        <p class="hint" id="make-mode-hint">点击预览图下方「✏️ 编辑感兴趣区域」，设置划区方式后，在预览图左键标点、右键完成当前区域。</p>
 
         <h3 class="param-title">重采样栅格设置</h3>
         <div class="level-row">
@@ -139,14 +136,96 @@
         <div class="actions">
           <button class="btn primary big" type="button" id="btn-run" disabled>开始生成诊断图与处方图</button>
         </div>
-      </div>
+      </details>
 
-      <!-- ④ 运行进度 -->
-      <div class="card hidden" id="card-progress">
-        <div class="card-head">
-          <span class="step-no">4</span>
-          <h2>运行进度</h2>
+      <details open class="card hidden" id="card-regions">
+        <summary class="card-head"><span class="step-no" id="region-step-no">4</span><h2>区域设置</h2></summary>
+        <p class="hint region-intro">在此设置划区参数，使用预览图下方的按钮开始编辑或导出区域。</p>
+        <div class="region-actions">
+          <button class="btn tiny hidden" type="button" id="btn-roi-groups" title="为不同区域组分别设置诊断分级与施肥映射">👥 编辑分组</button>
         </div>
+        <div class="roi-toolbar" id="roi-toolbar">
+          <div class="roi-method-row">
+            <label class="roi-method-label">划区方式
+              <select id="roi-method"><option value="sam" selected>半自动划区</option><option value="manual">手工多边形</option></select>
+            </label>
+            <button class="btn tiny danger" type="button" id="btn-roi-clear-all" disabled>清空全部</button>
+          </div>
+          <p class="roi-hint" id="roi-edit-hint">点击预览图下方「编辑感兴趣区域」后，在目标田块内添加提示点。</p>
+          <div class="sam-settings" id="sam-controls">
+            <div class="roi-field-grid">
+              <label class="roi-field">分割模型 <select id="sam-model"><option value="sam1_vit_h">SAM 1 · ViT-H</option></select></label>
+              <label class="roi-field">提示类型 <select id="sam-label"><option value="1">保留点（绿色）</option><option value="0">排除点（红色）</option></select></label>
+            </div>
+            <div class="roi-postprocess">
+              <div class="roi-option-row">
+                <label class="roi-check"><input type="checkbox" id="sam-fill-holes" checked> 去洞</label>
+                <label class="roi-number">最大洞面积 <span><input type="number" id="sam-hole-area" min="0.01" step="0.1" value="10"> 平方米</span></label>
+              </div>
+              <div class="roi-option-row">
+                <label class="roi-check"><input type="checkbox" id="sam-smooth-boundary" checked> 平滑边界</label>
+              </div>
+              <div class="roi-option-row">
+                <label class="roi-check"><input type="checkbox" id="sam-ignore-boundaries" checked> 忽略细小分割</label>
+                <label class="roi-number" title="合并细窄分割缝隙；过大的阈值可能合并真实田埂">宽度阈值 <span><input type="number" id="sam-gap-width" min="0.01" max="5" step="0.01" value="0.5"> 米</span></label>
+              </div>
+              <div class="roi-option-row roi-notch-row">
+                <label class="roi-check"><input type="checkbox" id="sam-fill-notches"> 填补小凹槽</label>
+                <div class="roi-notch-limits">
+                  <label class="roi-number">槽口最大宽度 <span><input type="number" id="sam-notch-width" min="0.01" max="5" step="0.1" value="0.5" disabled> 米</span></label>
+                  <label class="roi-number">凹槽最大面积 <span><input type="number" id="sam-notch-area" min="0.01" step="0.5" value="10" disabled> 平方米</span></label>
+                </div>
+                <span class="roi-notch-hint">局部填平与外部连通的小凹槽，保留大凹边界、内部空洞和排除位置。</span>
+              </div>
+            </div>
+            <div class="roi-toolbar-btns sam-actions">
+              <button class="btn tiny" type="button" id="btn-sam-predict" disabled>重新识别</button>
+              <button class="btn tiny primary" type="button" id="btn-sam-accept" disabled>确认加入区域</button>
+            </div>
+            <span class="roi-hint sam-status" id="sam-status" role="status" aria-live="polite"></span>
+          </div>
+          <div class="roi-toolbar-btns roi-edit-actions">
+            <button class="btn tiny" type="button" id="btn-roi-undo" title="Ctrl+Z：撤销上一点；当前无标点时删除最后一个区域，不恢复提示点" disabled>撤销</button>
+            <button class="btn tiny" type="button" id="btn-roi-clear-current" disabled>取消当前区域</button>
+            <button class="btn tiny primary" type="button" id="btn-roi-done" disabled>退出编辑</button>
+          </div>
+        </div>
+        <div class="roi-edit-operations">
+          <div class="roi-toolbar-btns">
+            <button class="btn" type="button" id="btn-roi-merge" disabled title="Ctrl 多选区域后点击合并，或按 H">合并</button>
+            <button class="btn" type="button" id="btn-roi-split" disabled title="Ctrl 选择一个区域后开始分割">分割</button>
+            <label class="roi-merge-distance" for="roi-merge-distance">最大合并距离
+              <input id="roi-merge-distance" type="number" min="-1" step="any" value="5" title="最近边缘的最短距离，单位米；-1 表示不限距离">
+              <span>米</span>
+            </label>
+          </div>
+          <p class="hint">按最近边缘距离连接成一个闭合区域；-1 表示不限距离，多选时每段连接均须满足限制。</p>
+          <p class="hint" id="roi-selection-status">编辑时按住 Ctrl 点击区域可多选；选中多个区域后按 H 合并。</p>
+          <div class="roi-split-tools hidden" id="roi-split-tools">
+            <p id="roi-split-status" class="hint"></p>
+            <div class="roi-toolbar-btns">
+              <button class="btn tiny primary" type="button" id="btn-roi-split-run">扫描并分割（回车）</button>
+              <button class="btn tiny" type="button" id="btn-roi-split-reset">清除折线</button>
+              <button class="btn tiny" type="button" id="btn-roi-split-cancel">取消分割</button>
+            </div>
+          </div>
+        </div>
+        <details class="roi-panel hidden" id="roi-panel">
+        <summary>感兴趣区域列表（<span id="roi-region-count">0</span> 个区域，<span id="roi-point-count">0</span> 个标点）</summary>
+        <div class="roi-panel-actions hidden" id="roi-panel-actions">
+          <button class="btn tiny" type="button" id="btn-group-add" title="将勾选的区域组成一个新分组">＋ 添加为分组</button>
+          <button class="btn tiny primary" type="button" id="btn-group-finish">✔ 完成</button>
+        </div>
+        <div id="roi-region-list" class="roi-region-list"></div>
+      </details>
+        <div class="viewer-mapinfo hidden" id="viewer-mapinfo"></div>
+      </details>
+
+      <details open class="card hidden" id="card-progress">
+        <summary class="card-head">
+          <span class="step-no">5</span>
+          <h2>运行进度</h2>
+        </summary>
         <div class="progress-wrap">
           <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
           <div class="progress-meta">
@@ -159,14 +238,13 @@
           <summary>运行日志</summary>
           <pre id="log-output"></pre>
         </details>
-      </div>
+      </details>
 
-      <!-- ⑤ 结果 -->
-      <div class="card hidden" id="card-result">
-        <div class="card-head">
-          <span class="step-no">5</span>
+      <details open class="card hidden" id="card-result">
+        <summary class="card-head">
+          <span class="step-no">6</span>
           <h2>生成结果</h2>
-        </div>
+        </summary>
         <div class="result-chips" id="result-chips"></div>
         <table class="mini-table" id="result-table"></table>
         <div class="legend-note" id="legend-note"></div>
@@ -191,7 +269,8 @@
           </div>
           <div id="dj2pr-report" class="hint"></div>
         </details>
-      </div>
+      </details>
+
     </section>
 
     <!-- 右侧图窗 -->
@@ -203,10 +282,11 @@
         <button class="tab" data-view="class" type="button" disabled>诊断图</button>
         <button class="tab" data-view="prescription" type="button" disabled>处方图</button>
       </div>
-      <div class="viewer-stage" id="viewer-stage">
+      <div class="viewer-stage" id="viewer-stage" tabindex="0" aria-label="影像预览及区域编辑">
+        <canvas id="roi-canvas" class="hidden"></canvas>
         <div id="viewer-transform" class="viewer-transform">
           <img id="viewer-img" alt="" draggable="false">
-          <canvas id="roi-canvas" class="hidden"></canvas>
+          <img id="viewer-detail" alt="" draggable="false" hidden>
         </div>
         <div class="viewer-empty" id="viewer-empty">
           <div>
@@ -216,34 +296,14 @@
         </div>
       </div>
       <div class="viewer-main-rest">
-        <div class="viewer-stats" id="viewer-stats"></div>
-        <div class="roi-toolbar hidden" id="roi-toolbar">
-          <label>划区方式 <select id="roi-method"><option value="manual">手工凸包</option><option value="sam">点提示自动划区</option></select></label>
-          <span class="roi-hint" id="roi-edit-hint">左键标点自动构成凸包 · 点击已有点删除 · 右键完成当前区域</span>
-          <span class="roi-toolbar-btns hidden" id="sam-controls">
-            <label>分割模型 <select id="sam-model"><option value="sam1_vit_h">SAM 1 · ViT-H</option></select></label>
-            <label>提示类型 <select id="sam-label"><option value="1">保留点（绿色）</option><option value="0">排除点（红色）</option></select></label>
-            <label><input type="checkbox" id="sam-fill-holes"> 去洞</label>
-            <label>最大洞面积 <input type="number" id="sam-hole-area" min="0.01" step="0.1" value="10" disabled> 平方米</label>
-            <label><input type="checkbox" id="sam-smooth-boundary"> 平滑边界</label>
-            <label><input type="checkbox" id="sam-ignore-boundaries"> 忽略细小分隔</label>
-            <label title="合并细窄分割缝隙；过大的阈值可能合并真实田埂">宽度阈值 <input type="number" id="sam-gap-width" min="0.01" max="5" step="0.01" value="0.2" disabled> 米</label>
-            <button class="btn tiny" type="button" id="btn-sam-predict">重新识别</button>
-            <button class="btn tiny primary" type="button" id="btn-sam-accept" disabled>确认加入区域</button>
-            <span class="roi-hint" id="sam-status" role="status" aria-live="polite"></span>
-          </span>
-          <span class="roi-toolbar-btns">
-            <button class="btn tiny" type="button" id="btn-roi-undo">撤销上一点</button>
-            <button class="btn tiny" type="button" id="btn-roi-clear-current">取消当前区域</button>
-            <button class="btn tiny" type="button" id="btn-roi-clear-all">清空全部</button>
-            <button class="btn tiny primary" type="button" id="btn-roi-done">退出编辑</button>
-          </span>
-        </div>
+        <div class="viewer-stats-row"><div class="viewer-stats" id="viewer-stats"></div><div class="viewer-result-legend" id="viewer-result-legend"></div></div>
+
         <div class="viewer-footer">
           <div class="viewer-legend" id="viewer-legend"></div>
           <div class="viewer-tools">
             <button class="btn tiny" type="button" id="btn-roi-edit" disabled title="校验并生成预览后可用">✏️ 编辑感兴趣区域</button>
-            <button class="btn tiny hidden" type="button" id="btn-roi-groups" title="为不同区域组分别设置诊断分级与施肥映射">👥 编辑分组</button>
+            <button class="btn tiny" type="button" id="btn-roi-export" disabled title="选择目录并填写文件名，直接保存 SHP 及配套文件（WGS84 经纬度）；请先右键完成当前区域">⬇ 导出 SHP</button>
+
             <button class="btn tiny" type="button" id="btn-zoom-in">＋</button>
             <button class="btn tiny" type="button" id="btn-zoom-out">－</button>
             <button class="btn tiny" type="button" id="btn-fit">适应</button>
@@ -252,15 +312,7 @@
       </div>
       </div>
     </section>
-      <details class="roi-panel hidden" id="roi-panel">
-        <summary>感兴趣区域列表（<span id="roi-region-count">0</span> 个区域，<span id="roi-point-count">0</span> 个标点）</summary>
-        <div class="roi-panel-actions hidden" id="roi-panel-actions">
-          <button class="btn tiny" type="button" id="btn-group-add" title="将勾选的区域组成一个新分组">＋ 添加为分组</button>
-          <button class="btn tiny primary" type="button" id="btn-group-finish">✔ 完成</button>
-        </div>
-        <div id="roi-region-list" class="roi-region-list"></div>
-      </details>
-      <div class="viewer-mapinfo hidden" id="viewer-mapinfo"></div>
+
     </div>
   </main>
 

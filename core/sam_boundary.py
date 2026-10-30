@@ -47,15 +47,20 @@ def _binary_filter_axis(mask, size, axis, dilate):
     return sums > 0 if dilate else sums == size
 
 
-def close_small_gaps(mask, kernel, coords, labels, valid=None, excluded=None):
-    """闭合细窄缝隙，保留原有前景、无效像元、已有区域和正负提示约束。"""
+def close_mask(mask, kernel):
+    """按指定像素宽度做闭运算，保留原有前景。"""
     kx, ky = kernel
     original = np.asarray(mask, dtype=bool)
     closed = _binary_filter_axis(original, kx, 1, True)
     closed = _binary_filter_axis(closed, ky, 0, True)
     closed = _binary_filter_axis(closed, kx, 1, False)
     closed = _binary_filter_axis(closed, ky, 0, False)
-    closed = closed | original
+    return closed | original
+
+
+def close_small_gaps(mask, kernel, coords, labels, valid=None, excluded=None):
+    """闭合细窄缝隙，保留原有前景、无效像元、已有区域和正负提示约束。"""
+    closed = close_mask(mask, kernel)
     if valid is not None:
         closed &= np.asarray(valid, dtype=bool)
     if excluded:

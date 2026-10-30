@@ -63,7 +63,9 @@ def lonlat_polygons_area(polygons_lonlat):
 
     支持顶点数组及包含 hull、holes 的区域字典；空洞面积从外轮廓扣除。
     """
-    polygons_lonlat = [p for p in (polygons_lonlat or [])
+    polygons_lonlat = [part for region in (polygons_lonlat or [])
+                       for part in (region.get("parts") or [region] if isinstance(region, dict) else [region])]
+    polygons_lonlat = [p for p in polygons_lonlat
                        if len(p["hull"] if isinstance(p, dict) else p) >= 3]
     if not polygons_lonlat:
         return {"area_m2": 0.0, "area_mu": 0.0}

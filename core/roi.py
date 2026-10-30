@@ -1,6 +1,6 @@
 """感兴趣区域（ROI）工具。
 
-流程：手工标点生成凸包，或点提示分割生成含空洞的真实轮廓 →
+流程：手工标点生成闭合多边形，或点提示分割生成含空洞的真实轮廓 →
 服务端把轮廓经纬度顶点换算到诊断网格像素坐标 → 按分块窗口做扫描线栅格化，
 与有效掩膜求交。全图尺寸可达数十亿像素，因此掩膜必须逐块生成，不能整图驻留。
 """
@@ -11,8 +11,7 @@ import numpy as np
 def convex_hull(points):
     """Andrew 单调链凸包（按像素坐标排序，与经纬度排序等价）。
 
-    服务端对收到的顶点先重排为凸包顺序，保证即使客户端传入乱序
-    或自交的顶点序列，栅格化结果仍是正确的凸包区域。
+    仅用于兼容未声明来源的旧格式区域。
     """
     pts = np.asarray(points, dtype="float64")
     if len(pts) < 3:
@@ -39,7 +38,7 @@ def convex_hull(points):
 
 
 def polygons_lonlat_to_pixel(polygons_lonlat, transform, crs=None):
-    """经纬度转诊断网格；手工区域重排凸包，分割区域保留边界和空洞。"""
+    """经纬度转诊断网格；保留手工凹多边形、分割边界及空洞。"""
     from rasterio.warp import transform as project
 
     inverse = ~transform
@@ -57,10 +56,16 @@ def polygons_lonlat_to_pixel(polygons_lonlat, transform, crs=None):
         return np.stack([cols, rows], axis=1)
 
     for region in polygons_lonlat:
+        if isinstance(region, dict) and region.get("parts"):
+            polygons_px.extend(polygons_lonlat_to_pixel(
+                [{**part, "source": "edited"} for part in region["parts"]], transform, crs))
+            continue
         if isinstance(region, dict):
             poly = convert(region["hull"])
-            if region.get("source") == "sam":
+            if region.get("source") in ("sam", "edited"):
                 polygons_px.append({"hull": poly, "holes": [convert(h) for h in region.get("holes", [])]})
+            elif region.get("source") == "manual":
+                polygons_px.append(poly)
             else:
                 polygons_px.append(convex_hull(poly))
         else:

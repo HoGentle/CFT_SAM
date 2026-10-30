@@ -101,7 +101,7 @@ def recognize_role(filename, recognition_config):
     return "preview"
 
 
-def scan_folder(folder, recognition_config):
+def scan_folder(folder, recognition_config, mode="prescription"):
     """扫描文件夹并按文件名归位（不拷贝文件，就地引用）。"""
     folder = Path(folder)
     if not folder.is_dir():
@@ -115,6 +115,12 @@ def scan_folder(folder, recognition_config):
         if path.suffix.lower() in IGNORED_SUFFIXES:
             continue
         role = recognize_role(path.name, recognition_config)
+        if role is not None and mode == "annotation":
+            try:
+                with rasterio.open(path) as src:
+                    role = "preview" if src.count in (3, 4) else None
+            except rasterio.errors.RasterioIOError:
+                role = None
         if role is None:
             skipped.append(path.name)
             continue
@@ -157,7 +163,7 @@ def _describe(path):
         }
 
 
-def validate_bundle(bundle):
+def validate_bundle(bundle, mode="prescription"):
     """校验输入完整性、波段数与同经纬度一致性。
 
     返回 (errors, warnings, report)。errors 非空时不可运行诊断。
@@ -166,7 +172,7 @@ def validate_bundle(bundle):
     warnings = []
     report = {"files": {}, "band_grid": None, "preview_overlay_ready": False}
 
-    for role in ("preview",) + BAND_ROLES:
+    for role in (("preview",) if mode == "annotation" else ("preview",) + BAND_ROLES):
         info = bundle.files.get(role)
         if info is None:
             continue
@@ -182,6 +188,21 @@ def validate_bundle(bundle):
             errors.append(f"无法读取 {info.name}: {exc}")
             entry["meta"] = None
         report["files"][role] = entry
+
+    if mode == "annotation":
+        meta = (report["files"].get("preview") or {}).get("meta")
+        if "preview" not in bundle.files:
+            errors.append("数据标注模式需要导入一张 RGB 或 RGBA 的 TIFF 影像")
+        elif meta:
+            if meta["count"] not in (3, 4):
+                errors.append("数据标注模式的 RGB 影像必须包含 3 或 4 个波段")
+            if not meta["crs"]:
+                errors.append("RGB 影像缺少坐标系，无法保存带地理坐标的感兴趣区域")
+            a, b, _, d, e, _ = meta["transform"]
+            if a * e - b * d == 0:
+                errors.append("RGB 影像的地理变换无效")
+            report["preview_overlay_ready"] = not errors
+        return errors, warnings, report
 
     if bundle.missing_channels():
         for role in bundle.missing_channels():

@@ -30,6 +30,7 @@ from flask import Flask, abort, jsonify, request, send_file, send_from_directory
 # 先导入 core（其 __init__ 会在 rasterio 导入前修正 Windows 下的 proj.db 冲突）
 from core import dj2pr as dj2pr_core
 from core import preview as preview_core
+from core import preview_detail
 from core import stats as stats_core
 from core.diagnose import STAGE_NAME_SUFFIX, make_unique_output_path, run_diagnosis
 from core.merge import merge_group_rasters
@@ -45,6 +46,7 @@ from core.inputs import (
 from core.jobs import JobManager
 from core.prescription import resolve_mapping, write_prescription_raster, write_resampled_prescription
 from core.roi import polygons_lonlat_to_pixel
+from core.roi_export import choose_shapefile_path, export_roi_shapefile
 from core.sam_roi import SamRoiService, validate_prompts
 from core.sam_window import predict_tiff_roi
 from core.sam_postprocess import validate_postprocess
@@ -75,6 +77,7 @@ _sam_service = SamRoiService(BASE_DIR / "checkpoint")
 
 class SessionState:
     def __init__(self):
+        self.mode = "prescription"
         self.bundle = InputBundle()
         self.validation = None
         self.band_paths = None
@@ -140,10 +143,12 @@ def session_payload():
         ]
         validation = SESSION.validation
         input_preview = SESSION.input_preview
+        mode = SESSION.mode
     return {
+        "mode": mode,
         "files": files,
         "conflicts": conflicts,
-        "missing": [ROLE_LABELS[r] for r in (set(BAND_ROLES) - set(files))],
+        "missing": [ROLE_LABELS[r] for r in (("preview",) if mode == "annotation" else BAND_ROLES) if r not in files],
         "validation": validation,
         "has_input_preview": input_preview is not None,
         "georef": input_preview.get("georef") if input_preview else None,
@@ -157,7 +162,8 @@ def _attach_input_area(info, band_paths):
     """给整体预览信息附带影像有效范围面积（整体预览图下方展示）。"""
     info["preview_id"] = uuid.uuid4().hex
     try:
-        info["area"] = stats_core.raster_valid_area(band_paths["B2"])
+        with rasterio.Env(GDAL_CACHEMAX=32 * 1024 * 1024, GDAL_NUM_THREADS="1"):
+            info["area"] = stats_core.raster_valid_area(band_paths.get("B2") or info["source_paths"]["preview"])
     except Exception as exc:  # noqa: BLE001 - 面积统计失败不阻塞预览
         app.logger.warning("影像面积统计失败: %s", exc)
     return info
@@ -167,8 +173,9 @@ def start_preview_job():
     """校验通过后生成输入整体预览（后台任务）。"""
     paths = SESSION.snapshot_paths()
     preview_tif = paths.get("preview")
-    band_paths = {role: paths[role] for role in ("B2", "B3", "B4") if role in paths}
-    if not band_paths:
+    band_paths = ({role: paths[role] for role in ("B2", "B3", "B4") if role in paths}
+                  if SESSION.mode == "prescription" else {})
+    if not band_paths and not preview_tif:
         return
 
     def runner(job):
@@ -233,6 +240,24 @@ def api_config():
 
 @app.get("/api/session")
 def api_session():
+    return jsonify(session_payload())
+
+
+@app.post("/api/mode")
+def api_mode():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "系统模式请求格式无效"}), 400
+    mode = data.get("mode")
+    if mode not in ("prescription", "annotation"):
+        return jsonify({"error": "系统模式无效"}), 400
+    if _job_manager.is_running():
+        return jsonify({"error": "请等待当前任务完成后切换模式"}), 409
+    with _state_lock:
+        SESSION.mode = mode
+        SESSION.validation = None
+        SESSION.band_paths = None
+        SESSION.input_preview = None
     return jsonify(session_payload())
 
 
@@ -301,6 +326,15 @@ def api_upload_finish():
 
     name = meta["name"]
     role = recognize_role(name, CONFIG["recognition"])
+    if role is not None and SESSION.mode == "annotation":
+        try:
+            with rasterio.open(part_path) as src:
+                if src.count not in (3, 4):
+                    raise ValueError("数据标注模式只需 RGB 或 RGBA 影像，请选择包含 3 或 4 个波段的 TIFF")
+            role = "preview"
+        except (ValueError, rasterio.errors.RasterioIOError) as exc:
+            part_path.unlink(missing_ok=True)
+            return jsonify({"error": str(exc)}), 400
     if role is None:
         part_path.unlink(missing_ok=True)
         return jsonify({"error": f"{name} 不是 tif/tiff 影像，已忽略"}), 400
@@ -313,7 +347,7 @@ def api_upload_finish():
     info = InputFile(path=target, name=name, size=actual, source="upload")
     with _state_lock:
         replaced = SESSION.bundle.files.get(role)
-        if replaced is not None and replaced.source == "upload":
+        if replaced is not None and replaced.source == "upload" and Path(replaced.path) != target:
             Path(replaced.path).unlink(missing_ok=True)
         SESSION.bundle.files.pop(role, None)
         SESSION.bundle.conflicts = [(r, f) for (r, f) in SESSION.bundle.conflicts if r != role]
@@ -350,7 +384,7 @@ def api_local_folder():
     data = request.get_json(force=True, silent=True) or {}
     folder = str(data.get("path") or "").strip().strip('"')
     try:
-        bundle, skipped = scan_folder(folder, CONFIG["recognition"])
+        bundle, skipped = scan_folder(folder, CONFIG["recognition"], mode=SESSION.mode)
     except FileNotFoundError as exc:
         return jsonify({"error": str(exc)}), 400
 
@@ -371,6 +405,8 @@ def api_local_folder():
 
 @app.post("/api/validate")
 def api_validate():
+    if _job_manager.is_running():
+        return jsonify({"error": "请等待当前任务完成后再校验"}), 409
     with _state_lock:
         bundle = SESSION.bundle
     if not bundle.files:
@@ -392,7 +428,7 @@ def api_validate():
                          "请重新上传: " + "、".join(missing_on_disk)
             }), 400
 
-    errors, warnings, report = validate_bundle(bundle)
+    errors, warnings, report = validate_bundle(bundle, mode=SESSION.mode)
     if missing_on_disk:
         warnings.insert(0, "已从会话移除磁盘上不存在的文件: " + "、".join(missing_on_disk))
     validation = {"errors": errors, "warnings": warnings, "report": report}
@@ -400,7 +436,7 @@ def api_validate():
         SESSION.validation = validation
         SESSION.band_paths = (
             {role: Path(bundle.files[role].path) for role in BAND_ROLES}
-            if not errors else None
+            if not errors and SESSION.mode == "prescription" else None
         )
 
     response = {**validation, "session": session_payload()}
@@ -414,9 +450,37 @@ def api_validate():
 # --------------------------------------------------------------------------
 
 def clean_roi_region(region):
-    """统一验证区域轮廓；分割来源允许凹多边形和内部空洞。"""
+    """统一验证区域轮廓；保留手工凹边界及分割区域的内部空洞。"""
     if not isinstance(region, dict):
         raise ValueError("区域格式无效")
+
+    # 投影坐标的 RGB 影像由服务端统一换算经纬度，避免把米制坐标写入 SHP。
+    if region.get("source") == "manual" and "pixel_hull" in region:
+        import numpy as np
+        from rasterio.warp import transform as project
+        with _state_lock:
+            preview = SESSION.input_preview
+        if not preview or region.get("preview_id") != preview.get("preview_id"):
+            raise ValueError("影像预览已变化，请重新标注区域")
+        g = preview["georef"]
+
+        def geographic(points):
+            pts = np.asarray(points, dtype=float)
+            if len(pts) == 0:
+                return []
+            if pts.ndim != 2 or pts.shape[1] != 2 or not np.isfinite(pts).all():
+                raise ValueError("区域像素坐标无效")
+            if (pts < 0).any() or (pts[:, 0] > g["preview_width"]).any() or (pts[:, 1] > g["preview_height"]).any():
+                raise ValueError("区域像素坐标超出预览范围")
+            sx = (pts[:, 0] + 0.5) * g["source_width"] / g["preview_width"]
+            sy = (pts[:, 1] + 0.5) * g["source_height"] / g["preview_height"]
+            a, b, c, d, e, f = g["transform"]
+            xs, ys = a * sx + b * sy + c, d * sx + e * sy + f
+            lons, lats = project(g["crs"], "EPSG:4326", xs.tolist(), ys.tolist())
+            return [list(p) for p in zip(lons, lats)]
+
+        region = {**region, "hull": geographic(region["pixel_hull"]),
+                  "points": geographic(region.get("pixel_points", []))}
 
     def clean_ring(ring):
         if not isinstance(ring, list) or not 3 <= len(ring) <= 100000:
@@ -428,7 +492,7 @@ def clean_roi_region(region):
             result.append([float(point[0]), float(point[1])])
         return result
 
-    source = "sam" if region.get("source") == "sam" else "manual"
+    source = region.get("source") if region.get("source") in ("sam", "edited") else "manual"
     holes = region.get("holes") or []
     if not isinstance(holes, list) or len(holes) > 10000:
         raise ValueError("区域空洞格式无效")
@@ -437,11 +501,23 @@ def clean_roi_region(region):
         raise ValueError("标点格式无效")
     cleaned = {
         "hull": clean_ring(region.get("hull")),
-        "holes": [clean_ring(h) for h in holes] if source == "sam" else [],
+        "holes": [clean_ring(h) for h in holes] if source != "manual" else [],
         "source": source,
         "points": [[float(p[0]), float(p[1])] for p in points
                    if isinstance(p, (list, tuple)) and len(p) == 2 and _is_lonlat(*p)],
     }
+    if region.get("parts") is not None:
+        parts = region["parts"]
+        if not isinstance(parts, list) or not 1 <= len(parts) <= 1000:
+            raise ValueError("区域的独立部分数量必须在 1 到 1000 之间")
+        cleaned["parts"] = []
+        for part in parts:
+            if not isinstance(part, dict) or not isinstance(part.get("holes", []), list):
+                raise ValueError("区域的独立部分格式无效")
+            cleaned["parts"].append({"hull": clean_ring(part.get("hull")),
+                                     "holes": [clean_ring(h) for h in part.get("holes", [])]})
+        cleaned.update(cleaned["parts"][0])
+        cleaned["source"] = "edited"
     if source == "sam":
         labels = region.get("point_labels") or []
         if len(labels) != len(cleaned["points"]) or any(label not in (0, 1) for label in labels):
@@ -537,6 +613,60 @@ def api_roi_area():
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": f"面积计算失败: {exc}"}), 400
     return jsonify({"region_count": len(cleaned), **area})
+
+
+@app.post("/api/roi/edit")
+def api_roi_edit():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "区域操作请求格式无效"}), 400
+    if _job_manager.is_running():
+        return jsonify({"error": "请等待当前任务完成后编辑区域"}), 409
+    with _state_lock:
+        preview = SESSION.input_preview
+    if not preview or data.get("preview_id") != preview.get("preview_id"):
+        return jsonify({"error": "影像预览已变化，请重新选择区域"}), 409
+    from core.roi_edit import edit_regions
+    try:
+        result = edit_regions(preview, data.get("regions"), data.get("operation"), data.get("guide"),
+                              data.get("merge_max_distance_m", 5), data.get("excluded_regions"))
+    except (ValueError, TypeError, KeyError) as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        app.logger.exception("区域编辑失败")
+        return jsonify({"error": f"区域操作失败：{exc}"}), 500
+    with _state_lock:
+        if SESSION.input_preview is not preview:
+            return jsonify({"error": "影像已变化，区域操作结果已丢弃"}), 409
+    return jsonify({**result, "preview_id": preview["preview_id"]})
+
+
+@app.post("/api/roi/export-shp")
+def api_roi_export_shp():
+    data = request.get_json(silent=True)
+    regions = data.get("regions") if isinstance(data, dict) else None
+    if not isinstance(regions, list) or not regions:
+        return jsonify({"error": "请先完成至少一个感兴趣区域，再导出 SHP"}), 400
+    try:
+        cleaned = [clean_roi_region(region) for region in regions]
+        files = export_roi_shapefile(cleaned)
+    except (TypeError, ValueError) as exc:
+        return jsonify({"error": f"区域导出失败：{exc}"}), 400
+    try:
+        rgb = SESSION.bundle.files.get("preview")
+        default_name = (Path(rgb.name).stem if rgb else SESSION.bundle.base_name()).rstrip(". ") or "result"
+        path = choose_shapefile_path(default_name)
+        if path is None:
+            return jsonify({"cancelled": True})
+        saved = []
+        for suffix, content in files.items():
+            target = path.with_suffix(f".{suffix}")
+            target.write_bytes(content)
+            saved.append(str(target))
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        return jsonify({"error": f"区域保存失败：{exc}"}), 500
+    return jsonify({"cancelled": False, "files": saved, "directory": str(path.parent),
+                    "region_count": len(cleaned)})
 
 
 def _class_legend_items(result):
@@ -683,6 +813,8 @@ def api_preview_annotate():
 
 @app.post("/api/run")
 def api_run():
+    if SESSION.mode == "annotation":
+        return jsonify({"error": "数据标注模式用于区域标注，请切换到处方图模式进行诊断"}), 400
     if _job_manager.is_running():
         return jsonify({"error": "已有任务正在运行，请等待完成。"}), 409
 
@@ -732,7 +864,7 @@ def api_run():
     out_dir.mkdir(parents=True, exist_ok=True)
     base_name = SESSION.bundle.base_name()
 
-    # ---- 生成范围：全图 或 感兴趣区域（凸包经纬度 -> 诊断网格像素多边形） ----
+    # ---- 生成范围：全图 或 感兴趣区域（边界经纬度 -> 诊断网格像素多边形） ----
     # 影像 CRS 同时供 ROI 换算与地面栅格重采样使用
     with rasterio.open(band_paths["B2"]) as band_src:
         band_transform = band_src.transform
@@ -771,7 +903,7 @@ def api_run():
             "region_count": len(cleaned_regions),
             "regions": cleaned_regions,
             "area": roi_area,
-            "note": "hull 为轮廓经纬度；手工区域为凸包，sam 区域保留凹边界和 holes 空洞；points 为标点，point_labels 为正负提示标签",
+            "note": "hull 为轮廓经纬度，保留手工及 sam 区域的凹边界；holes 为空洞；points 为标点，point_labels 为正负提示标签",
         }
         job_log_roi = f"感兴趣区域制作：{len(cleaned_regions)} 个区域（{roi_area['area_mu']:.2f} 亩）"
     else:
@@ -1304,6 +1436,34 @@ def api_download():
     if not path.is_file():
         abort(404)
     return send_file(path, as_attachment=True, download_name=path.name)
+
+
+@app.get("/api/preview/detail")
+def api_preview_detail():
+    with _state_lock:
+        preview = SESSION.input_preview
+    if not preview or request.args.get("preview_id") != preview.get("preview_id"):
+        return jsonify({"error": "预览已更新，请刷新影像"}), 409
+    try:
+        bounds = [float(request.args[key]) for key in ("x", "y", "w", "h")]
+        size = [int(request.args[key]) for key in ("width", "height")]
+        preview_detail.validate_view(preview["georef"], bounds, size)
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return jsonify({"error": "视野参数无效或输出超过像素限制"}), 400
+    if not preview_detail.READ_SLOT.acquire(blocking=False):
+        return jsonify({"error": "影像读取繁忙，请稍后重试"}), 429
+    try:
+        output = preview_detail.render_detail(preview, bounds, size)
+        with _state_lock:
+            if SESSION.input_preview is not preview:
+                return jsonify({"error": "预览已更新，请刷新影像"}), 409
+        response = send_file(output, mimetype="image/png", max_age=0)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    except (OSError, rasterio.errors.RasterioError, ValueError):
+        return jsonify({"error": "原图细节读取失败，请检查影像文件"}), 422
+    finally:
+        preview_detail.READ_SLOT.release()
 
 
 @app.get("/previews/<path:name>")
