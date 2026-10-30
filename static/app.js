@@ -1017,24 +1017,28 @@ function formatNum(v) {
 
 /* ---------------- 图窗 ---------------- */
 const viewer = { scale: 1, tx: 0, ty: 0, naturalW: 0, naturalH: 0, url: null };
-const detail = { timer: null, controller: null, version: 0, url: null, ready: false };
+const detail = { timer: null, controller: null, version: 0, url: null, ready: false,
+  pending: null, cache: [] };
 
 function clearViewerDetail() {
   detail.version++;
   clearTimeout(detail.timer);
+  detail.timer = null;
   if (detail.controller) detail.controller.abort();
   detail.controller = null;
+  detail.pending = null;
   const img = $("viewer-detail");
   img.hidden = true;
   img.removeAttribute("src");
-  if (detail.url) URL.revokeObjectURL(detail.url);
+  detail.cache.forEach(entry => URL.revokeObjectURL(entry.url));
+  detail.cache = [];
   detail.url = null;
 }
 
 function detailView() {
   if (!detail.ready || state.currentView !== "input" || !state.session?.georef || viewer.scale <= 0) return null;
   const stage = $("viewer-stage"), g = state.session.georef;
-  // 浏览器只保留当前视野的一张细节图，最多 200 万像素。
+  // 每次读取最多 200 万像素，视野之外的预读也计入此预算。
   const x = Math.max(0, -viewer.tx / viewer.scale);
   const y = Math.max(0, -viewer.ty / viewer.scale);
   const w = Math.min(viewer.naturalW, (stage.clientWidth - viewer.tx) / viewer.scale) - x;
@@ -1049,18 +1053,71 @@ function detailView() {
     height: Math.max(1, Math.floor(h * density * factor)), preview_id: state.session.preview_id };
 }
 
+function bufferedDetailView(view) {
+  // 四周各多读四分之一窗口，小幅平移直接使用已解码图片。
+  const x = Math.max(0, view.x - view.w * 0.25);
+  const y = Math.max(0, view.y - view.h * 0.25);
+  const w = Math.min(viewer.naturalW, view.x + view.w * 1.25) - x;
+  const h = Math.min(viewer.naturalH, view.y + view.h * 1.25) - y;
+  const density = Math.min(view.width / view.w, view.height / view.h);
+  const factor = Math.min(1, 2048 / (w * density), 2048 / (h * density),
+    Math.sqrt(2000000 / (w * h * density * density)));
+  return { ...view, x, y, w, h, width: Math.max(1, Math.floor(w * density * factor)),
+    height: Math.max(1, Math.floor(h * density * factor)) };
+}
+
+function detailCovers(candidate, visible, target) {
+  return candidate && candidate.preview_id === visible.preview_id &&
+    candidate.x <= visible.x && candidate.y <= visible.y &&
+    candidate.x + candidate.w >= visible.x + visible.w - 1e-6 &&
+    candidate.y + candidate.h >= visible.y + visible.h - 1e-6 &&
+    candidate.width / candidate.w >= target.width / target.w * 0.95 &&
+    candidate.height / candidate.h >= target.height / target.h * 0.95;
+}
+
+function showViewerDetail(entry) {
+  const img = $("viewer-detail"), view = entry.view;
+  Object.assign(img.style, { left: `${view.x}px`, top: `${view.y}px`, width: `${view.w}px`, height: `${view.h}px` });
+  img.src = entry.url;
+  img.hidden = false;
+  detail.url = entry.url;
+  // 最近使用的图片移到队尾，最多保留三张、共 600 万像素。
+  detail.cache = detail.cache.filter(item => item !== entry);
+  detail.cache.push(entry);
+  while (detail.cache.length > 3) URL.revokeObjectURL(detail.cache.shift().url);
+}
+
+function detailNearEdge(previous, visible) {
+  return (previous.x > 0 && visible.x - previous.x < visible.w * 0.08) ||
+    (previous.y > 0 && visible.y - previous.y < visible.h * 0.08) ||
+    (previous.x + previous.w < viewer.naturalW && previous.x + previous.w - visible.x - visible.w < visible.w * 0.08) ||
+    (previous.y + previous.h < viewer.naturalH && previous.y + previous.h - visible.y - visible.h < visible.h * 0.08);
+}
+
 function scheduleViewerDetail() {
+  const visible = detailView();
+  if (!visible) { clearViewerDetail(); return; }
+  const view = bufferedDetailView(visible);
+  const matches = [...detail.cache].reverse().filter(entry => detailCovers(entry.view, visible, view));
+  const cached = matches.find(entry => !detailNearEdge(entry.view, visible)) || matches[0];
+  if (cached) showViewerDetail(cached);
+  // 视野仍在预读范围内时，保留已有请求，避免拖动反复取消原图读取。
+  if (detailCovers(detail.pending, visible, view)) return;
   clearTimeout(detail.timer);
+  detail.timer = null;
   detail.version++;
   if (detail.controller) detail.controller.abort();
-  const view = detailView();
-  if (!view) { clearViewerDetail(); return; }
+  detail.controller = null;
+  detail.pending = null;
+  if (cached && !detailNearEdge(cached.view, visible)) return;
   const version = detail.version;
-  detail.timer = setTimeout(() => loadViewerDetail(view, version), 160);
+  detail.pending = view;
+  detail.timer = setTimeout(() => loadViewerDetail(view, version), 80);
 }
 
 async function loadViewerDetail(view, version) {
   if (version !== detail.version) return;
+  detail.timer = null;
   const controller = new AbortController();
   detail.controller = controller;
   let url = null;
@@ -1068,6 +1125,7 @@ async function loadViewerDetail(view, version) {
     const response = await fetch("/api/preview/detail?" + new URLSearchParams(view), { signal: controller.signal, cache: "no-store" });
     if (version !== detail.version) return;
     if (response.status === 429) {
+      detail.pending = view;
       detail.timer = setTimeout(() => loadViewerDetail(view, version), 350);
       return;
     }
@@ -1077,18 +1135,16 @@ async function loadViewerDetail(view, version) {
     image.src = url;
     await image.decode();
     if (version !== detail.version || state.session?.preview_id !== view.preview_id) return;
-    const img = $("viewer-detail");
-    Object.assign(img.style, { left: `${view.x}px`, top: `${view.y}px`, width: `${view.w}px`, height: `${view.h}px` });
-    img.src = url;
-    img.hidden = false;
-    if (detail.url) URL.revokeObjectURL(detail.url);
-    detail.url = url;
+    showViewerDetail({ view, url });
     url = null;
   } catch (error) {
     // 取消或读取失败时保留整体预览，继续支持缩放和划区。
   } finally {
     if (url) URL.revokeObjectURL(url);
-    if (detail.controller === controller) detail.controller = null;
+    if (detail.controller === controller) {
+      detail.controller = null;
+      if (detail.timer == null) detail.pending = null;
+    }
   }
 }
 
@@ -2480,7 +2536,6 @@ function updateRoiPanel() {
 
   const list = $("roi-region-list");
   list.innerHTML = "";
-  const fmt = (p) => `${p.lon != null ? p.lon.toFixed(6) : "-"}, ${p.lat != null ? p.lat.toFixed(6) : "-"}`;
 
   /* 区域行（编辑分组模式时前面带勾选框；已入组的区域灰勾禁选） */
   const groupedRegions = new Set();
@@ -2496,11 +2551,9 @@ function updateRoiPanel() {
         `${picked ? " checked" : ""}${inGroup ? " checked disabled" : ""}` +
         ` title="${inGroup ? "该区域已加入分组，不能重复添加" : "勾选后可添加为分组"}">`
       : "";
-    const ptsText = region.points.map((p, i) => `${i + 1}.(${fmt(p)})`).join(" ");
     div.innerHTML = `
       ${cb}
       <span class="rr-title">区域${idx + 1}${region.model_label ? `<br>${escapeHtml(region.model_label)}` : ""}</span>
-      <span class="rr-pts">${region.source === "sam" ? "自动轮廓" : region.source === "edited" ? "编辑边界" : "手工边界"}顶点 ${regionParts(region).reduce((n,p)=>n+p.hull.length,0)} / ${region.source === "edited" ? `独立部分 ${regionParts(region).length}` : `${region.source === "sam" ? "提示点" : "标点"} ${region.points.length}`}${region.holes && region.holes.length ? ` / 空洞 ${region.holes.length}` : ""}：<br>${ptsText}</span>
       <button class="rr-del" title="删除该区域">×</button>`;
     div.querySelector(".rr-del").addEventListener("click", () => {
       if (roiEdit.busy) return;

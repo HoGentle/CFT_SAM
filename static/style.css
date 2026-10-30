@@ -464,8 +464,7 @@ details.roi-panel {
   border: 1px solid var(--border); border-radius: 6px; padding: 6px 9px;
   font-size: 12px; display: flex; gap: 8px; align-items: flex-start;
 }
-.roi-region .rr-title { font-weight: 600; color: var(--green-dark); flex: none; }
-.roi-region .rr-pts { flex: 1; color: var(--muted); word-break: break-all; line-height: 1.7; }
+.roi-region .rr-title { font-weight: 600; color: var(--green-dark); flex: 1; }
 .roi-region .rr-del { border: none; background: none; color: #b0b8b2; cursor: pointer; flex: none; }
 .roi-region .rr-del:hover { color: var(--danger); }
 .viewer-empty {
